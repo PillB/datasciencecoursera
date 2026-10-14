@@ -204,12 +204,12 @@ ORDER BY id_regla;
    ──────────────────────────────────────────────────────────────────────────── */
 WITH completitud AS (
   SELECT 'COMPLETITUD' AS dimension,
-         100 * (1 - avg((n_nulos + n_vacios + n_solo_espacios + n_placeholder) / n_filas)) AS puntaje,
+         100 * (1 - avg((n_nulos + n_vacios + n_solo_espacios + n_placeholder) / NULLIF(n_filas, 0))) AS puntaje,
          'L1: promedio por columna' AS fuente
   FROM dq_l1_perfil
 ), unicidad AS (
   SELECT 'UNICIDAD' AS dimension,
-         100 * (SELECT count(*) FROM (SELECT DISTINCT * FROM dq_src)) / count(*) AS puntaje,
+         100 * (SELECT count(*) FROM (SELECT DISTINCT * FROM dq_src)) / NULLIF(count(*), 0) AS puntaje,
          'dq_src: filas distintas / filas' AS fuente
   FROM dq_src
 ), validez AS (

@@ -112,7 +112,7 @@ _ULTIMA = ["?"]
 
 
 def etiqueta(s):
-    m = re.findall(r"\[([A-Z][0-9]\.[0-9]{2}[a-z]?)\]", s)
+    m = re.findall(r"\[([A-Z][A-Z0-9]*\.[0-9]{2}[a-z0-9]*)\]", s)
     if m:
         _ULTIMA[0] = m[0]
     return _ULTIMA[0]
