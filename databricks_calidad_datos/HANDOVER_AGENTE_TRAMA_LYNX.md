@@ -2875,7 +2875,7 @@ and backticks. The label of each result is the first `[ID]` in its comment block
 | G volume | tabular, ~42k rows, Jan–Jun 2024, with `fec_operacion` (text AAAAMMDD), `fecactualizacion` TIMESTAMP and `nombre_archivo` | Daily load D carries business date D−1 (95%) plus 5% late (D+1). Volume: weekdays ≈300, Saturday ≈150, Sunday ≈60; holidays at 20%. Seeded: (G1) the 13-Mar load did not run and its file was loaded on the 14th; (G2) the 17-Apr load is partial (25%); (G3) file 22-May resent as `…_REENVIO` and loaded on the 23rd; (G4) no loads 10–12 Jun; (G5) `cod_moneda` empty for the whole 20-Feb load; (G6) the last day holds only 40%. `dq_lv_feriados` = Semana Santa. |
 | H volume, clean | the same generator, no defects | Control for false alarms; holidays still lower volume. |
 
-**Assertions (the answer key)**
+**Assertions (the answer key): all passing for scenarios A–H with ANSI on and off**
 
 | Scenario | The test asserts that… |
 |---|---|
