@@ -33,6 +33,8 @@
      dq_mostrar_pii      : false = los ejemplos de campos PII salen enmascarados.
      dq_ld_*             : campos del trailer para los totales de control [LD.08].
      dq_estado / dq_log  : estado de la corrida y bitácora de escenarios.
+     dq_id_regla         : regla cuyos ejemplos muestra [L8.02v2] ('' = la
+                           primera con fallas).
      dq_lv_*             : Capa V (volumen por fecha de carga, de negocio y
                            por archivo/lote) [LV.00-LV.08]:
        dq_lv_activo : false apaga la capa (cada consulta LV lee la tabla
@@ -65,6 +67,7 @@ DECLARE OR REPLACE VARIABLE dq_ld_tipo_trailer        STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_ld_campo_conteo        STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_ld_campo_suma_trailer  STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_ld_campo_suma_detalle  STRING  DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_id_regla               STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_lv_activo              BOOLEAN DEFAULT true;
 DECLARE OR REPLACE VARIABLE dq_lv_col_carga           STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_lv_col_negocio         STRING  DEFAULT '';
@@ -545,3 +548,38 @@ SET VAR dq_log = array_append(dq_log, named_struct(
     WHEN 'TABLA_VACIA' THEN 'Sin filas: las capas correrán pero sus resultados estarán vacíos. Hipótesis: carga no ejecutada, filtro de filas de Unity Catalog, o tipo de registro objetivo que no existe en la data.'
     WHEN 'SIN_COLUMNAS' THEN 'Ninguna columna perfilable: revisen dq_regex_excluir_columnas y el formato detectado.'
     ELSE 'Preparación correcta.' END));
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+   [Z2.05] Validación de nombres que escribió el equipo (clave de negocio)
+   DOCSTRING (es-PE)
+     dq_columnas_clave la escribe una persona y el archivo 02 la usa para
+     muestrear y L1.07/L1.08 para medir unicidad: si nombra una columna que
+     no existe en dq_objetivo, esas consultas fallarían (UNRESOLVED_COLUMN)
+     y "Run all" se detendría. Aquí se compara cada nombre (sin importar
+     mayúsculas ni backticks) con dq_columnas; si alguno falta, la clave se
+     desactiva ('') y queda registrado en dq_log con los nombres disponibles.
+     Si todo existe, normaliza la lista (sin backticks ni espacios), porque
+     el archivo 02 agrega sus propios backticks.
+   TOOLTIP ▸ Cómo interpretar
+     • CLAVE_INVALIDA en LZ.01: corrijan dq_columnas_clave. En ancho fijo
+       los nombres son los del diccionario normalizados (p.ej. nro_tarjeta),
+       no los de la tabla cruda.
+     • dq_expr_segmento y dq_expr_objetivo son expresiones libres y NO se
+       pueden validar sin ejecutarlas: si fallan, el error indica la columna.
+   ──────────────────────────────────────────────────────────────────────────── */
+DECLARE OR REPLACE VARIABLE dq_columnas_clave_invalidas STRING DEFAULT '';
+SET VAR dq_columnas_clave_invalidas = coalesce((
+  SELECT concat_ws(', ', collect_list(k))
+  FROM (SELECT trim(replace(k, '`', '')) AS k FROM (SELECT explode(split(dq_columnas_clave, ',')) AS k)) x
+  WHERE k <> '' AND lower(k) NOT IN (SELECT lower(columna) FROM dq_columnas WHERE columna IS NOT NULL)), '');
+
+SET VAR dq_log = IF(dq_columnas_clave_invalidas = '', dq_log, array_append(dq_log, named_struct(
+  'paso', 'Z2.05', 'escenario', 'CLAVE_INVALIDA',
+  'detalle', concat('dq_columnas_clave = ', dq_columnas_clave, '; no existen: ', dq_columnas_clave_invalidas,
+                    '; columnas disponibles (primeras 20): ',
+                    coalesce((SELECT array_join(slice(collect_list(columna), 1, 20), ', ') FROM dq_columnas WHERE columna IS NOT NULL), '')),
+  'interpretacion', 'Se desactivó la clave: la muestra es por hash de fila y L1.07/L1.08 salen omitidas. Corrijan el nombre y vuelvan a correr.')));
+
+SET VAR dq_columnas_clave = IF(dq_columnas_clave_invalidas = '',
+  array_join(filter(transform(split(dq_columnas_clave, ','), k -> trim(replace(k, '`', ''))), k -> k <> ''), ','), '');

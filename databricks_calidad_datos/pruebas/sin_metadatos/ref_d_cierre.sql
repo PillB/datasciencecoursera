@@ -21,7 +21,7 @@
      • Sirve para armar el caso con el dueño de la fuente sin exponer datos
        personales. Cambien de regla con SET VAR dq_id_regla = 'D007';
    ──────────────────────────────────────────────────────────────────────────── */
-DECLARE OR REPLACE VARIABLE dq_id_regla STRING DEFAULT '';
+-- dq_id_regla se declara en Z1.01 (antes de VALORES A COMPLETAR) para que el equipo pueda fijarla.
 SET VAR dq_id_regla = coalesce(nullif(dq_id_regla, ''),
   (SELECT min(x.id_regla) FROM dq_l8_resultados x WHERE x.n_fallas > 0), '');
 

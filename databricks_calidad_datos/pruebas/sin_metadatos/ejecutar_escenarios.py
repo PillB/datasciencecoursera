@@ -34,13 +34,15 @@ ESCENARIOS = {
     "B": {"tabla": "spark_catalog.lynx.ancho_fijo", "vars": {
         "dq_tipo_registro_objetivo": "'DETALLE'", "dq_pos_tipo_registro": "1", "dq_len_tipo_registro": "2",
         "dq_ld_tipo_trailer": "'TRAILER'", "dq_ld_campo_conteo": "'CANT_REGISTROS'",
-        "dq_ld_campo_suma_trailer": "'IMP_TOTAL'", "dq_ld_campo_suma_detalle": "'IMP_OPERACION'"}},
+        "dq_ld_campo_suma_trailer": "'IMP_TOTAL'", "dq_ld_campo_suma_detalle": "'IMP_OPERACION'",
+        "dq_columnas_clave": "'nro_tarjeta, columna_inexistente'"}},
     "C": {"tabla": "spark_catalog.lynx.vacia", "vars": {"dq_tipo_registro_objetivo": "'DETALLE'"}},
     "D": {"tabla": "spark_catalog.lynx.delimitada", "vars": {"dq_tipo_registro_objetivo": "'DETALLE'"}},
     "E": {"tabla": "spark_catalog.lynx.ancho_fijo_limpio", "vars": {
         "dq_tipo_registro_objetivo": "'DETALLE'", "dq_pos_tipo_registro": "1", "dq_len_tipo_registro": "2",
         "dq_ld_tipo_trailer": "'TRAILER'", "dq_ld_campo_conteo": "'CANT_REGISTROS'",
-        "dq_ld_campo_suma_trailer": "'IMP_TOTAL'", "dq_ld_campo_suma_detalle": "'IMP_OPERACION'"}},
+        "dq_ld_campo_suma_trailer": "'IMP_TOTAL'", "dq_ld_campo_suma_detalle": "'IMP_OPERACION'",
+        "dq_columnas_clave": "'`NRO_TARJETA`'"}},
     "F": {"tabla": None, "vars": {}},
     "G": {"tabla": "spark_catalog.lynx.volumen", "vars": {
         "dq_tipo_registro_objetivo": "'DETALLE'", "dq_lv_feriados": "'" + mk.FERIADOS_EXTRA_G + "'"}},
@@ -190,6 +192,12 @@ def verificar(clave, res, completo):
         ex = filas(res, "L8.02v2")
         chk(ex and all("nro_tarjeta" not in str(getattr(r, "fila", "")) or '"nro_tarjeta":"9999' in str(r.fila) for r in ex),
             "L8.02v2 expuso un PAN sin enmascarar")
+    if clave == "B":
+        chk(any(r.escenario == "CLAVE_INVALIDA" for r in lz), "Z2.05 no desactivó la clave con columna inexistente")
+    if clave == "E":
+        chk(not any(r.escenario == "CLAVE_INVALIDA" for r in lz), "Z2.05 desactivó una clave válida")
+        chk(filas(res, "L1.07") and getattr(filas(res, "L1.07")[0], "n_filas", None) is not None,
+            f"L1.07 debía evaluar la clave nro_tarjeta: {filas(res, 'L1.07')[:1]}")
     if clave == "C":
         chk(any(r.escenario == "TABLA_VACIA" for r in lz), "LZ.01 no reportó TABLA_VACIA")
     if clave == "D":

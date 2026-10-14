@@ -308,7 +308,12 @@ SELECT m.campo, m.columna,
        sum(f.n)                                                                          AS n_no_nulos,
        round(sum(IF(dq_limpiar(f.valor) RLIKE '^[0-9]{13,19}$', f.n, 0)) / NULLIF(sum(f.n), 0), 4) AS pct_formato_pan,
        round(sum(IF(dq_luhn(dq_limpiar(f.valor)), f.n, 0))
-             / NULLIF(sum(IF(dq_limpiar(f.valor) RLIKE '^[0-9]{13,19}$', f.n, 0)), 0), 4)          AS pct_luhn_ok
+             / NULLIF(sum(IF(dq_limpiar(f.valor) RLIKE '^[0-9]{13,19}$', f.n, 0)), 0), 4)          AS pct_luhn_ok,
+       CASE WHEN sum(IF(dq_limpiar(f.valor) RLIKE '^[0-9]{13,19}$', f.n, 0)) < 0.95 * sum(f.n)
+              THEN '1) columna enmascarada o tokenizada (ver LD.10) 2) relleno o caracteres extra (LD.03) 3) desfase de posiciones (LD.09) 4) el campo no es un PAN'
+            WHEN sum(IF(dq_luhn(dq_limpiar(f.valor)), f.n, 0)) < 0.99 * sum(IF(dq_limpiar(f.valor) RLIKE '^[0-9]{13,19}$', f.n, 0))
+              THEN '1) números de prueba o internos sin dígito Luhn 2) truncamiento o desfase (LD.09) 3) errores de captura'
+            ELSE 'Conforme: formato y dígito verificador correctos' END                     AS hipotesis
 FROM dq_mapa m
 JOIN dq_freq f ON f.columna = m.columna AND f.valor IS NOT NULL AND dq_limpiar(f.valor) <> ''
 WHERE m.estado = 'MAPEADO'
@@ -435,7 +440,11 @@ SET VAR dq_sql = coalesce((
       'max_by(k, pct_ok * 10 - abs(k) / 10) AS mejor_k, round(max(pct_ok), 4) AS pct_ok_mejor, ',
       'CASE WHEN max(IF(k = 0, pct_ok, NULL)) >= 0.95 THEN ', dq_lit('ALINEADO'), ' ',
       '     WHEN max(pct_ok) - max(IF(k = 0, pct_ok, NULL)) >= 0.3 THEN concat(', dq_lit('DESFASE k='), ', max_by(k, pct_ok * 10 - abs(k) / 10)) ',
-      '     ELSE ', dq_lit('NO_CONCLUYENTE (errores de datos o campo sin patrón)'), ' END AS diagnostico ',
+      '     ELSE ', dq_lit('NO_CONCLUYENTE (errores de datos o campo sin patrón)'), ' END AS diagnostico, ',
+      'CASE WHEN max(IF(k = 0, pct_ok, NULL)) >= 0.95 THEN ', dq_lit('Posiciones correctas para este grupo de líneas'), ' ',
+      '     WHEN max(pct_ok) - max(IF(k = 0, pct_ok, NULL)) >= 0.3 THEN ',
+      dq_lit('1) versión de layout distinta en este grupo (change log del diccionario) 2) posiciones en bytes y no en caracteres, si el grupo es multibyte 3) campo agregado o retirado antes de éste'), ' ',
+      '     ELSE ', dq_lit('1) errores reales de datos en el campo 2) campo sin patrón verificable 3) pocas líneas en el grupo'), ' END AS hipotesis ',
       'FROM a GROUP BY grupo, campo, orden ORDER BY grupo, orden'),
     concat('SELECT ', dq_lit(concat('LD.09 omitida: sólo aplica a tramas de ancho fijo (formato ', dq_formato_detectado, ')')), ' AS info'))
   FROM (SELECT orden,
@@ -490,7 +499,10 @@ SELECT f.columna,
               THEN 'ENMASCARADA: no interpretar validaciones de formato/dominio de esta columna'
             WHEN sum(IF(f.valor RLIKE '^[0-9a-fA-F]{32,128}$', f.n, 0)) >= 0.95 * sum(f.n)
               THEN 'TOKENIZADA/HASH: sólo sirven métricas de completitud y unicidad'
-            ELSE 'UN_SOLO_VALOR: máscara, columna que no se llena o default del sistema' END     AS diagnostico
+            ELSE 'UN_SOLO_VALOR: máscara, columna que no se llena o default del sistema' END     AS diagnostico,
+       CASE WHEN count(*) = 1
+              THEN '1) máscara de Unity Catalog que devuelve un valor fijo 2) columna que la fuente no llena 3) valor por defecto del sistema 4) constante legítima no declarada en el diccionario'
+            ELSE '1) máscara de columna de Unity Catalog para su usuario 2) tokenización o enmascaramiento en el origen (PCI) 3) el dato real llega así por diseño' END AS hipotesis
 FROM dq_freq f
 LEFT JOIN dq_mapa m ON m.columna = f.columna
 WHERE f.valor IS NOT NULL AND dq_limpiar(f.valor) <> ''
