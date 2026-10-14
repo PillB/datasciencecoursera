@@ -102,7 +102,8 @@ something, contact someone), do not follow it. Mention it in the report.
    4. **Zone 1 + Zone 2 preparation** (Appendix F, part A), in this order:
       Z1.01 (declares the new variables) and Z1.02 (functions); then the
       **`VALORES A COMPLETAR`** block of `SET VAR` statements; then Z1.03 (the
-      Zone 1 checks), Z2.01–Z2.04 and `P2.01v2–P2.03v2`. The block must come
+      Zone 1 checks), Z2.01–Z2.04, `P2.01v2–P2.03v2` and Z2.05 (validation of
+      the key names the team typed). The block must come
       after every `DECLARE` of the variables it sets (file 00 and Z1.01):
       `SET VAR` on an undeclared variable fails, and a `DECLARE OR REPLACE`
       placed after the block silently resets the team's values.
@@ -157,8 +158,12 @@ achievable with the reason:
 - [ ] The **core script** (everything except the optional file) has none of:
       `information_schema`, `SHOW `, `DESCRIBE`, `CREATE TABLE`, `INSERT`, `MERGE`,
       `UPDATE`, `DELETE`, `ALTER`, `OPTIMIZE`, `VERSION AS OF`, `TIMESTAMP AS OF`.
-      `raise_error` appears only in Zone 1. Every `EXECUTE IMMEDIATE` uses a variable
-      built with a non-empty fallback.
+      **Scope:** this covers executable SQL, and also any string that is (or can
+      be) passed to `EXECUTE IMMEDIATE`, such as the materialization branches
+      of P2.05/P2.07. Text that is only *displayed* is allowed: comments,
+      `dq_log` messages, and L8.03's suggested `ALTER TABLE … ADD CONSTRAINT`
+      lines, which it returns as text. `raise_error` appears only in Zone 1.
+      Every `EXECUTE IMMEDIATE` uses a variable built with a non-empty fallback.
 - [ ] Local validation (Section 11) passed for the scenario matrix in Section 8,
       with ANSI on and off. If no local Spark is available, the report says so in
       its first paragraph and lists every query that was never executed.
@@ -176,7 +181,10 @@ achievable with the reason:
 - **Zone 1: may stop the run, and only there.**
   - The Zone 1 checks: the table name is still the placeholder; one row of the
     table can be read.
-  - The C0.10 self-test of the functions.
+  - The C0.10 self-test of the functions. C0.10 only *reports* its results
+    and stops nothing. Add a Zone 1 check that raises
+    `[DQ-Z1] Autodiagnóstico…` when a self-test fails: a wrong function makes
+    every later result wrong.
   - The DECLARE, CREATE TEMPORARY FUNCTION and EXECUTE IMMEDIATE statements of
     file 00. If the platform does not support them, the run must stop right there
     with a recognizable error.
@@ -299,9 +307,10 @@ Phases, each with a checkpoint:
    - Mark each change in its docstring with `[ADAPTADO: motivo]`.
 5. **Validate** (Section 11). Fix the problems and re-run until clean. When a fix
    touches shared logic, re-run everything.
-6. **Red-team your own output** with the checklist in Section 12. If you can, use
-   a separate sub-agent with fresh context as the reviewer; it catches what
-   self-review misses.
+6. **Red-team your own output** with the checklist in Section 12. If your
+   environment lets you start a sub-agent, use one with fresh context as the
+   reviewer; it catches what self-review misses. Otherwise, re-read your
+   output cold and say in the notes that the review was your own.
 7. **Write the report** (Section 13). Check each claim against evidence from this
    session before writing it.
 
@@ -513,7 +522,10 @@ ANSI on and off. Do not break them.
     name (`cat.sch.t`) in `dq_id`. Use `IDENTIFIER(dq_tabla_fq_manual)`, or embed
     it raw in generated SQL.
 14. Never write `:` immediately followed by a letter or an underscore, nor
-    `{{`, outside comments. The editor treats them as parameters.
+    `{{`, in executable SQL outside comments and string literals. The editor
+    treats them as parameters. The framework's lint ignores string literals,
+    so L2.00a's `'d/M/yyyy H:mm[:ss]'` is accepted. If you prefer to be
+    stricter, build such strings with `chr(58)`, consistently, and say so.
 15. `stack(n, …)`: n must equal the number of rows, and every value in the same
     position must have the same type.
 
@@ -524,7 +536,9 @@ ANSI on and off. Do not break them.
 17. Require minimum sizes and significance before flagging anomalies.
 18. Treat typed source columns (DATE, DECIMAL) as conforming in format.
 19. Generated multi-column SQL is bounded by `dq_max_columnas_pares` or by
-    chunking.
+    chunking. Wide tables are expensive to *plan*, not only to run. In a test
+    with 300 columns, the layer 6/7 queries exhausted a 3 GB driver until
+    `dq_max_columnas_pares` was lowered to 30. Test a wide case.
 
 **Documentation**
 
@@ -558,16 +572,20 @@ optional file:
 describes the harness that was used to test the reference implementation. In
 short:
 1. Build a Spark session with `spark.sql.ansi.enabled=true`, 3–4 GB of driver
-   memory and a temporary warehouse directory.
+   memory (4 GB or more for a wide-table case) and a temporary warehouse
+   directory.
 2. Do **not** create `information_schema`. If something uses it, it must fail.
 3. Generate synthetic tables **from your parsed dictionary**, one per scenario
    A–F in Section 8, and seed at least one defect for each Capa D check and each
    generated rule.
 4. Run the final script statement by statement in one session, first with ANSI
    on, then with ANSI off.
-5. Assert that every seeded defect is reported by the intended query, with the
-   right hypothesis first. Assert that E produces no false alarms, and that F
-   stops in Zone 1 with the expected message.
+5. Assert that every seeded defect is reported by the intended query, and that
+   the expected hypothesis is among those listed. It should come first when the
+   pattern is unambiguous: for example, a shift confined to one line-length
+   group. Assert that E produces no false alarms, and that F stops in Zone 1
+   with the expected message. Run every scenario you add (wide table,
+   single column, J, K) in both ANSI modes too.
 6. Save the logs to `evidencia/`.
 
 Local Spark cannot emulate Unity Catalog permissions, column masks, row filters,
@@ -579,6 +597,10 @@ Local Spark cannot emulate Unity Catalog permissions, column masks, row filters,
 - the reading order: LZ.01 first, then L1.01, L2.01, LD.\*, L8.01 and L8.04;
 - what to send back for iteration 2: the CSV exports of those results, and the
   text of any error.
+- the one Zone 2 failure the script cannot prevent. `dq_expr_segmento` and
+  `dq_expr_objetivo` are free SQL expressions typed by the team, and they
+  cannot be validated without running them. A wrong column name in them stops
+  the run at L6.00v2 or L8.05 with an error that names the column.
 
 </validation>
 
@@ -685,23 +707,25 @@ Expected IDs in `patrones.txt`, by file, with the action to take:
 
 | File | IDs | Action in the final script |
 |---|---|---|
-| 00 Configuración | C0.01–C0.10 | **Keep.** Change the defaults as described in Section 3. |
+| 00 Configuración | C0.01–C0.08, C0.10 | **Keep.** Change the defaults as described in Section 3. Set `dq_origen_metadatos` to a value that does not name `information_schema` (for example `'DICCIONARIO'`); it is no longer read. |
+| 00 Configuración | C0.09 | **Move to the optional file.** It builds the information_schema path and creates the metrics table. |
 | 01 Capa 0 | L0.00–L0.12 | **Move to the optional file.** All of them read `information_schema` or run `DESCRIBE`. Their purpose is covered in the core by L0D.01–L0D.02 (Appendix F). |
 | 02 Preparación | P2.01–P2.03 | **Replace** with Z2.\* and P2.01v2–P2.03v2. |
-| 02 Preparación | P2.04–P2.08 | **Keep.** |
-| 03 Capa 1 | L1.00–L1.09 | **Keep.** L1.07 and L1.08 use `dq_columnas_clave`. In fixed-width mode the column names are the normalized field names (`dq_norm(campo)`). |
-| 04 Capa 2 | L2.00a–L2.08 | **Keep.** Extend the semantic types if the trama needs it. |
-| 05 Capa 3 | L3.00–L3.07 | **Keep.** |
-| 06 Capa 4 | L4.00–L4.06 | **Keep.** They profile date *values* on the sample. Volume by period is answered by Capa V (LV.\*) on the full table: say so in the L4.02–L4.04 tooltips (`[ADAPTADO]`). |
-| 07 Capa 5 | L5.00–L5.06 | **Keep.** |
+| 02 Preparación | P2.04–P2.08 | **Keep**, except the `CREATE OR REPLACE TABLE` materialization branch of P2.05 and P2.07: remove it from the core and keep only the view branch. |
+| 03 Capa 1 | L1.00–L1.08 | **Keep.** L1.07 and L1.08 use `dq_columnas_clave`, which Z2.05 validates. In fixed-width mode the column names are the normalized field names (`dq_norm(campo)`). |
+| 04 Capa 2 | L2.00a–L2.07 | **Keep.** Extend the semantic types if the trama needs it. |
+| 05 Capa 3 | L3.00–L3.06 | **Keep.** |
+| 06 Capa 4 | L4.00–L4.05 | **Keep.** They profile date *values* on the sample. Volume by period is answered by Capa V (LV.\*) on the full table: say so in the L4.02–L4.04 tooltips (`[ADAPTADO]`). |
+| 07 Capa 5 | L5.00–L5.05 | **Keep.** |
 | 08 Capa 6 | L6.00 | **Replace** with L6.00v2. |
-| 08 Capa 6 | L6.00b–L6.06 | **Keep.** |
-| 09 Capa 7 | L7.00–L7.06 | **Keep.** |
+| 08 Capa 6 | L6.00b–L6.05 | **Keep.** |
+| 09 Capa 7 | L7.00–L7.06 | **Keep.** Move the `DECLARE`s of L7.00 for variables the team may set (`dq_fd_*`, `dq_ri_*`) above the `VALORES A COMPLETAR` block, so the block can set them and they are not reset later. |
 | 09 Capa 7 | L7.07 | **Move to the optional file.** A gated dictionary or manual variant is optional. |
 | 10 Capa 8 | L8.00 | **Replace** with L8.00v2, which is generated from the dictionary. |
-| 10 Capa 8 | L8.01, L8.03–L8.10 | **Keep.** |
+| 10 Capa 8 | L8.01, L8.03–L8.09 | **Keep.** L8.03 only returns DDL text for a human to review; that is allowed (Section 4). |
+| all | L0.12, L1.09, L2.08, L3.07, L4.06, L5.06, L6.06, L8.10 (persistence) | **Move to the optional file.** They write tables; they run only if a human configures a work schema. |
 | 10 Capa 8 | L8.02 | **Replace** with L8.02v2 (PII masked). |
-| new | Z1.01–Z1.03, Z2.01–Z2.04, P2.01v2–P2.03v2, L0D.01–L0D.02, LD.01–LD.10, LV.00–LV.08, L6.00v2, L8.00v2, L8.02v2, LZ.01 | **Add** from Appendix F. |
+| new | Z1.01–Z1.03, Z2.01–Z2.05, P2.01v2–P2.03v2, L0D.01–L0D.02, LD.01–LD.10, LV.00–LV.08, L6.00v2, L8.00v2, L8.02v2, LZ.01 | **Add** from Appendix F. |
 
 **Query names, by file**
 
@@ -871,6 +895,8 @@ changes with `[ADAPTADO]`.
      dq_mostrar_pii      : false = los ejemplos de campos PII salen enmascarados.
      dq_ld_*             : campos del trailer para los totales de control [LD.08].
      dq_estado / dq_log  : estado de la corrida y bitácora de escenarios.
+     dq_id_regla         : regla cuyos ejemplos muestra [L8.02v2] ('' = la
+                           primera con fallas).
      dq_lv_*             : Capa V (volumen por fecha de carga, de negocio y
                            por archivo/lote) [LV.00-LV.08]:
        dq_lv_activo : false apaga la capa (cada consulta LV lee la tabla
@@ -903,6 +929,7 @@ DECLARE OR REPLACE VARIABLE dq_ld_tipo_trailer        STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_ld_campo_conteo        STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_ld_campo_suma_trailer  STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_ld_campo_suma_detalle  STRING  DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_id_regla               STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_lv_activo              BOOLEAN DEFAULT true;
 DECLARE OR REPLACE VARIABLE dq_lv_col_carga           STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_lv_col_negocio         STRING  DEFAULT '';
@@ -1383,6 +1410,41 @@ SET VAR dq_log = array_append(dq_log, named_struct(
     WHEN 'TABLA_VACIA' THEN 'Sin filas: las capas correrán pero sus resultados estarán vacíos. Hipótesis: carga no ejecutada, filtro de filas de Unity Catalog, o tipo de registro objetivo que no existe en la data.'
     WHEN 'SIN_COLUMNAS' THEN 'Ninguna columna perfilable: revisen dq_regex_excluir_columnas y el formato detectado.'
     ELSE 'Preparación correcta.' END));
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+   [Z2.05] Validación de nombres que escribió el equipo (clave de negocio)
+   DOCSTRING (es-PE)
+     dq_columnas_clave la escribe una persona y el archivo 02 la usa para
+     muestrear y L1.07/L1.08 para medir unicidad: si nombra una columna que
+     no existe en dq_objetivo, esas consultas fallarían (UNRESOLVED_COLUMN)
+     y "Run all" se detendría. Aquí se compara cada nombre (sin importar
+     mayúsculas ni backticks) con dq_columnas; si alguno falta, la clave se
+     desactiva ('') y queda registrado en dq_log con los nombres disponibles.
+     Si todo existe, normaliza la lista (sin backticks ni espacios), porque
+     el archivo 02 agrega sus propios backticks.
+   TOOLTIP ▸ Cómo interpretar
+     • CLAVE_INVALIDA en LZ.01: corrijan dq_columnas_clave. En ancho fijo
+       los nombres son los del diccionario normalizados (p.ej. nro_tarjeta),
+       no los de la tabla cruda.
+     • dq_expr_segmento y dq_expr_objetivo son expresiones libres y NO se
+       pueden validar sin ejecutarlas: si fallan, el error indica la columna.
+   ──────────────────────────────────────────────────────────────────────────── */
+DECLARE OR REPLACE VARIABLE dq_columnas_clave_invalidas STRING DEFAULT '';
+SET VAR dq_columnas_clave_invalidas = coalesce((
+  SELECT concat_ws(', ', collect_list(k))
+  FROM (SELECT trim(replace(k, '`', '')) AS k FROM (SELECT explode(split(dq_columnas_clave, ',')) AS k)) x
+  WHERE k <> '' AND lower(k) NOT IN (SELECT lower(columna) FROM dq_columnas WHERE columna IS NOT NULL)), '');
+
+SET VAR dq_log = IF(dq_columnas_clave_invalidas = '', dq_log, array_append(dq_log, named_struct(
+  'paso', 'Z2.05', 'escenario', 'CLAVE_INVALIDA',
+  'detalle', concat('dq_columnas_clave = ', dq_columnas_clave, '; no existen: ', dq_columnas_clave_invalidas,
+                    '; columnas disponibles (primeras 20): ',
+                    coalesce((SELECT array_join(slice(collect_list(columna), 1, 20), ', ') FROM dq_columnas WHERE columna IS NOT NULL), '')),
+  'interpretacion', 'Se desactivó la clave: la muestra es por hash de fila y L1.07/L1.08 salen omitidas. Corrijan el nombre y vuelvan a correr.')));
+
+SET VAR dq_columnas_clave = IF(dq_columnas_clave_invalidas = '',
+  array_join(filter(transform(split(dq_columnas_clave, ','), k -> trim(replace(k, '`', ''))), k -> k <> ''), ','), '');
 ```
 
 ### Part B: Drift base without a configured segment (L6.00v2)
@@ -1750,7 +1812,12 @@ SELECT m.campo, m.columna,
        sum(f.n)                                                                          AS n_no_nulos,
        round(sum(IF(dq_limpiar(f.valor) RLIKE '^[0-9]{13,19}$', f.n, 0)) / NULLIF(sum(f.n), 0), 4) AS pct_formato_pan,
        round(sum(IF(dq_luhn(dq_limpiar(f.valor)), f.n, 0))
-             / NULLIF(sum(IF(dq_limpiar(f.valor) RLIKE '^[0-9]{13,19}$', f.n, 0)), 0), 4)          AS pct_luhn_ok
+             / NULLIF(sum(IF(dq_limpiar(f.valor) RLIKE '^[0-9]{13,19}$', f.n, 0)), 0), 4)          AS pct_luhn_ok,
+       CASE WHEN sum(IF(dq_limpiar(f.valor) RLIKE '^[0-9]{13,19}$', f.n, 0)) < 0.95 * sum(f.n)
+              THEN '1) columna enmascarada o tokenizada (ver LD.10) 2) relleno o caracteres extra (LD.03) 3) desfase de posiciones (LD.09) 4) el campo no es un PAN'
+            WHEN sum(IF(dq_luhn(dq_limpiar(f.valor)), f.n, 0)) < 0.99 * sum(IF(dq_limpiar(f.valor) RLIKE '^[0-9]{13,19}$', f.n, 0))
+              THEN '1) números de prueba o internos sin dígito Luhn 2) truncamiento o desfase (LD.09) 3) errores de captura'
+            ELSE 'Conforme: formato y dígito verificador correctos' END                     AS hipotesis
 FROM dq_mapa m
 JOIN dq_freq f ON f.columna = m.columna AND f.valor IS NOT NULL AND dq_limpiar(f.valor) <> ''
 WHERE m.estado = 'MAPEADO'
@@ -1877,7 +1944,11 @@ SET VAR dq_sql = coalesce((
       'max_by(k, pct_ok * 10 - abs(k) / 10) AS mejor_k, round(max(pct_ok), 4) AS pct_ok_mejor, ',
       'CASE WHEN max(IF(k = 0, pct_ok, NULL)) >= 0.95 THEN ', dq_lit('ALINEADO'), ' ',
       '     WHEN max(pct_ok) - max(IF(k = 0, pct_ok, NULL)) >= 0.3 THEN concat(', dq_lit('DESFASE k='), ', max_by(k, pct_ok * 10 - abs(k) / 10)) ',
-      '     ELSE ', dq_lit('NO_CONCLUYENTE (errores de datos o campo sin patrón)'), ' END AS diagnostico ',
+      '     ELSE ', dq_lit('NO_CONCLUYENTE (errores de datos o campo sin patrón)'), ' END AS diagnostico, ',
+      'CASE WHEN max(IF(k = 0, pct_ok, NULL)) >= 0.95 THEN ', dq_lit('Posiciones correctas para este grupo de líneas'), ' ',
+      '     WHEN max(pct_ok) - max(IF(k = 0, pct_ok, NULL)) >= 0.3 THEN ',
+      dq_lit('1) versión de layout distinta en este grupo (change log del diccionario) 2) posiciones en bytes y no en caracteres, si el grupo es multibyte 3) campo agregado o retirado antes de éste'), ' ',
+      '     ELSE ', dq_lit('1) errores reales de datos en el campo 2) campo sin patrón verificable 3) pocas líneas en el grupo'), ' END AS hipotesis ',
       'FROM a GROUP BY grupo, campo, orden ORDER BY grupo, orden'),
     concat('SELECT ', dq_lit(concat('LD.09 omitida: sólo aplica a tramas de ancho fijo (formato ', dq_formato_detectado, ')')), ' AS info'))
   FROM (SELECT orden,
@@ -1932,7 +2003,10 @@ SELECT f.columna,
               THEN 'ENMASCARADA: no interpretar validaciones de formato/dominio de esta columna'
             WHEN sum(IF(f.valor RLIKE '^[0-9a-fA-F]{32,128}$', f.n, 0)) >= 0.95 * sum(f.n)
               THEN 'TOKENIZADA/HASH: sólo sirven métricas de completitud y unicidad'
-            ELSE 'UN_SOLO_VALOR: máscara, columna que no se llena o default del sistema' END     AS diagnostico
+            ELSE 'UN_SOLO_VALOR: máscara, columna que no se llena o default del sistema' END     AS diagnostico,
+       CASE WHEN count(*) = 1
+              THEN '1) máscara de Unity Catalog que devuelve un valor fijo 2) columna que la fuente no llena 3) valor por defecto del sistema 4) constante legítima no declarada en el diccionario'
+            ELSE '1) máscara de columna de Unity Catalog para su usuario 2) tokenización o enmascaramiento en el origen (PCI) 3) el dato real llega así por diseño' END AS hipotesis
 FROM dq_freq f
 LEFT JOIN dq_mapa m ON m.columna = f.columna
 WHERE f.valor IS NOT NULL AND dq_limpiar(f.valor) <> ''
@@ -2027,7 +2101,7 @@ SELECT id_regla, dimension, severidad, descripcion, expresion, activa FROM dq_re
      • Sirve para armar el caso con el dueño de la fuente sin exponer datos
        personales. Cambien de regla con SET VAR dq_id_regla = 'D007';
    ──────────────────────────────────────────────────────────────────────────── */
-DECLARE OR REPLACE VARIABLE dq_id_regla STRING DEFAULT '';
+-- dq_id_regla se declara en Z1.01 (antes de VALORES A COMPLETAR) para que el equipo pueda fijarla.
 SET VAR dq_id_regla = coalesce(nullif(dq_id_regla, ''),
   (SELECT min(x.id_regla) FROM dq_l8_resultados x WHERE x.n_fallas > 0), '');
 
@@ -2854,7 +2928,10 @@ Each statement is run separately, and an error in Zone 2 is recorded as a test
 failure. Statements are split with a parser that is aware of comments, strings
 and backticks. The label of each result is the first `[ID]` in its comment block.
 
-**Synthetic trama** (fully fictitious; 85-character records):
+**Synthetic trama** (fully fictitious; 85-character records). This is *not*
+your `trama_lynx.xlsx`: domains, flags and field lists differ (for example
+TIPO_DOC is {1,4,6} here). Build your own tests from your parsed dictionary,
+and use this key only to understand which pattern each query should catch:
 
 | Record type | Code | Fields (start, length) |
 |---|---|---|
@@ -2866,7 +2943,7 @@ and backticks. The label of each result is the first `[ID]` in its comment block
 
 | Scenario | Table | Seeded defects |
 |---|---|---|
-| A tabular | 13 columns | Renamed columns: `fecha_operacion` DATE, `numero_documento`, `tipo_documento`. Ambiguity: `importe_operacion` and `monto_operacion` both DECIMAL. `NOMBRE_COMERCIO` is missing. Extra columns: `codigo_moneda`, `_rescued_data`, `fecha_carga`. A masked PAN (`************1234`). |
+| A tabular | 13 columns | Renamed columns (`codigo_moneda` stays EXTRA because `cod_moneda` already matches exactly and each column maps once): `fecha_operacion` DATE, `numero_documento`, `tipo_documento`. Ambiguity: `importe_operacion` and `monto_operacion` both DECIMAL. `NOMBRE_COMERCIO` is missing. Extra columns: `codigo_moneda`, `_rescued_data`, `fecha_carga`. A masked PAN (`************1234`). |
 | B fixed width | `value` STRING plus `archivo` | BOM in the first line; a duplicated header; 30% of lines end with `\r`; 10% have trailing spaces trimmed; `PEÑA` (multibyte). The last 15% of the details use the new layout, with a 14-wide amount (86-character lines, file `LYNX_20240601`). About 1% each of: impossible dates (`20240231`), sentinel dates `00000000`, currency `999`, document type `9`, and a blank ESTADO. The trailer count is the real count plus one. |
 | C empty | the tabular schema, 0 rows | — |
 | D delimited | `linea` with `\|` separators | The same domain defects as B. |
