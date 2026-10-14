@@ -33,6 +33,21 @@
      dq_mostrar_pii      : false = los ejemplos de campos PII salen enmascarados.
      dq_ld_*             : campos del trailer para los totales de control [LD.08].
      dq_estado / dq_log  : estado de la corrida y bitácora de escenarios.
+     dq_lv_*             : Capa V (volumen por fecha de carga, de negocio y
+                           por archivo/lote) [LV.00-LV.08]:
+       dq_lv_activo : false apaga la capa (cada consulta LV lee la tabla
+         completa; útil si la tabla es enorme).
+       dq_lv_col_carga / dq_lv_col_negocio / dq_lv_col_lote : columnas a usar
+         (p.ej. 'fecactualizacion', 'fec_operacion', 'nombre_archivo'); ''
+         = autodetección por tipo y nombre (regex dq_lv_regex_*).
+       dq_lv_umbral_bajo / dq_lv_umbral_alto : razón vs. la mediana del mismo
+         día de semana (8 semanas previas) para marcar BAJO / ALTO.
+       dq_lv_dias_recientes : últimos días que pueden estar incompletos
+         (datos que aún no llegan); se marcan aparte, no como falla.
+       dq_lv_feriados : feriados adicionales 'AAAA-MM-DD,…' (p.ej. Jueves y
+         Viernes Santo, feriados puntuales); los fijos de Perú ya vienen.
+       dq_lv_granularidad : 'AUTO' (DIA si el rango ≤ 400 días, si no MES),
+         'DIA' o 'MES' para la deriva de vacíos por periodo [LV.08].
    TOOLTIP ▸ Cómo interpretar
      • No devuelve filas. Todo lo que el script decida queda en dq_log; al
        final [LZ.01] lo muestra completo con su interpretación.
@@ -50,6 +65,17 @@ DECLARE OR REPLACE VARIABLE dq_ld_tipo_trailer        STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_ld_campo_conteo        STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_ld_campo_suma_trailer  STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_ld_campo_suma_detalle  STRING  DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_lv_activo              BOOLEAN DEFAULT true;
+DECLARE OR REPLACE VARIABLE dq_lv_col_carga           STRING  DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_lv_col_negocio         STRING  DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_lv_col_lote            STRING  DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_lv_regex_carga         STRING  DEFAULT '(?i)(actualiz|fec_?act|f_?act|carga|cargue|proces|ingest|load|insert|upd|modif|audit|etl|corte|snapshot|extrac)';
+DECLARE OR REPLACE VARIABLE dq_lv_regex_lote          STRING  DEFAULT '(?i)(archivo|arch|file|lote|batch|origen|source|path|ruta)';
+DECLARE OR REPLACE VARIABLE dq_lv_umbral_bajo         DOUBLE  DEFAULT 0.5;
+DECLARE OR REPLACE VARIABLE dq_lv_umbral_alto         DOUBLE  DEFAULT 1.6;
+DECLARE OR REPLACE VARIABLE dq_lv_dias_recientes      INT     DEFAULT 3;
+DECLARE OR REPLACE VARIABLE dq_lv_feriados            STRING  DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_lv_granularidad        STRING  DEFAULT 'AUTO';
 DECLARE OR REPLACE VARIABLE dq_estado                 STRING  DEFAULT 'OK';
 DECLARE OR REPLACE VARIABLE dq_log ARRAY<STRUCT<paso STRING, escenario STRING, detalle STRING, interpretacion STRING>>
   DEFAULT CAST(array() AS ARRAY<STRUCT<paso STRING, escenario STRING, detalle STRING, interpretacion STRING>>);
@@ -64,6 +90,8 @@ DECLARE OR REPLACE VARIABLE dq_pct_delim_estable      DOUBLE  DEFAULT 0;
 DECLARE OR REPLACE VARIABLE dq_largos_esperados       STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_codigo_registro_obj    STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_n_filas_acceso         BIGINT  DEFAULT 0;
+DECLARE OR REPLACE VARIABLE dq_cols_extra_a           STRING  DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_cols_extra_b           STRING  DEFAULT '';
 
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -373,6 +401,9 @@ SELECT dq_formato_detectado AS formato_detectado, round(dq_pct_match, 4) AS pct_
          fallar decode()), sobre la línea sin BOM ni \r final; más _dq_linea y
          _dq_tipo_registro. Nombres = dq_norm(campo) (+ sufijo si se repite).
        DELIMITADO : una columna por campo, por orden del diccionario.
+       En ambos casos se conservan las demás columnas de la tabla (p.ej.
+       archivo, fecha de carga, fecactualizacion) con su nombre original, o
+       con sufijo _origen si chocan con un campo: la Capa V las necesita.
      También crea dq_mapa (campo → columna en dq_objetivo + atributos del
      diccionario + tipo real) que usan la Capa D y las reglas.
    TOOLTIP ▸ Cómo interpretar
@@ -380,15 +411,33 @@ SELECT dq_formato_detectado AS formato_detectado, round(dq_pct_match, 4) AS pct_
        perfilado (dq_regex_excluir_columnas).
      • En ANCHO_FIJO los valores NO se recortan: el relleno se evalúa en [LD.03].
    ──────────────────────────────────────────────────────────────────────────── */
+SET VAR dq_cols_extra_a = coalesce((
+  SELECT array_join(transform(array_sort(collect_list(struct(ordinal, e))), x -> x.e), '')
+  FROM (SELECT x.ordinal, concat(', ', dq_id(x.columna), ' AS ',
+                                 dq_id(IF(p.nombre IS NULL, x.columna, concat(x.columna, '_origen')))) AS e
+        FROM dq_cols_reales x
+        LEFT JOIN (SELECT DISTINCT lower(dq_norm(campo)) AS nombre FROM dq_diccionario
+                   WHERE dq_tipo_registro_objetivo = '' OR tipo_registro = dq_tipo_registro_objetivo) p
+          ON p.nombre = lower(x.columna)
+        WHERE x.columna <> dq_col_linea AND NOT lower(x.columna) RLIKE '^_dq_')), '');
+SET VAR dq_cols_extra_b = coalesce((
+  SELECT array_join(transform(array_sort(collect_list(struct(ordinal, e))), x -> x.e), '')
+  FROM (SELECT x.ordinal, concat(', ', dq_id(IF(p.nombre IS NULL, x.columna, concat(x.columna, '_origen')))) AS e
+        FROM dq_cols_reales x
+        LEFT JOIN (SELECT DISTINCT lower(dq_norm(campo)) AS nombre FROM dq_diccionario
+                   WHERE dq_tipo_registro_objetivo = '' OR tipo_registro = dq_tipo_registro_objetivo) p
+          ON p.nombre = lower(x.columna)
+        WHERE x.columna <> dq_col_linea AND NOT lower(x.columna) RLIKE '^_dq_')), '');
+
 SET VAR dq_sql = CASE
   WHEN dq_formato_detectado = 'ANCHO_FIJO' THEN coalesce((
     SELECT concat(
       'CREATE OR REPLACE TEMP VIEW dq_objetivo AS SELECT ',
       array_join(transform(array_sort(collect_list(struct(orden, e))), x -> x.e), ', '),
-      ', _dq_linea, _dq_tipo_registro FROM (SELECT l AS _dq_linea, ',
+      ', _dq_linea, _dq_tipo_registro', dq_cols_extra_b, ' FROM (SELECT l AS _dq_linea, ',
       IF(dq_len_tipo_registro > 0, concat('substr(l, ', dq_pos_tipo_registro, ', ', dq_len_tipo_registro, ')'), 'CAST(NULL AS STRING)'),
-      ' AS _dq_tipo_registro FROM (SELECT regexp_replace(regexp_replace(', dq_id(dq_col_linea), ', ',
-      dq_lit('^\\x{FEFF}'), ', ', dq_lit(''), '), ', dq_lit('\\r$'), ', ', dq_lit(''), ') AS l FROM ', dq_tabla_fq_manual,
+      ' AS _dq_tipo_registro', dq_cols_extra_b, ' FROM (SELECT regexp_replace(regexp_replace(', dq_id(dq_col_linea), ', ',
+      dq_lit('^\\x{FEFF}'), ', ', dq_lit(''), '), ', dq_lit('\\r$'), ', ', dq_lit(''), ') AS l', dq_cols_extra_a, ' FROM ', dq_tabla_fq_manual,
       ' WHERE ', dq_id(dq_col_linea), ' IS NOT NULL) a) b',
       IF(dq_len_tipo_registro > 0 AND dq_codigo_registro_obj <> '',
          concat(' WHERE _dq_tipo_registro = ', dq_lit(dq_codigo_registro_obj)), ''))
@@ -408,9 +457,9 @@ SET VAR dq_sql = CASE
     SELECT concat(
       'CREATE OR REPLACE TEMP VIEW dq_objetivo AS SELECT ',
       array_join(transform(array_sort(collect_list(struct(orden, e))), x -> x.e), ', '),
-      ', _dq_linea FROM (SELECT ', dq_id(dq_col_linea), ' AS _dq_linea, split(', dq_id(dq_col_linea), ', ',
+      ', _dq_linea', dq_cols_extra_b, ' FROM (SELECT ', dq_id(dq_col_linea), ' AS _dq_linea, split(', dq_id(dq_col_linea), ', ',
       CASE dq_delimitador WHEN 'TAB' THEN 'chr(9)' WHEN '|' THEN dq_lit('[|]') ELSE dq_lit(dq_delimitador) END,
-      ') AS _dq_partes FROM ', dq_tabla_fq_manual, ') a')
+      ') AS _dq_partes', dq_cols_extra_a, ' FROM ', dq_tabla_fq_manual, ') a')
     FROM (SELECT orden, concat('try_element_at(_dq_partes, ', CAST(rn AS STRING), ') AS ', dq_id(nombre)) AS e
           FROM (SELECT orden, row_number() OVER (ORDER BY orden) AS rn,
                        concat(dq_norm(campo), IF(row_number() OVER (PARTITION BY dq_norm(campo) ORDER BY orden) > 1,

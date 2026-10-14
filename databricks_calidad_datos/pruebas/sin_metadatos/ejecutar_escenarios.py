@@ -42,6 +42,10 @@ ESCENARIOS = {
         "dq_ld_tipo_trailer": "'TRAILER'", "dq_ld_campo_conteo": "'CANT_REGISTROS'",
         "dq_ld_campo_suma_trailer": "'IMP_TOTAL'", "dq_ld_campo_suma_detalle": "'IMP_OPERACION'"}},
     "F": {"tabla": None, "vars": {}},
+    "G": {"tabla": "spark_catalog.lynx.volumen", "vars": {
+        "dq_tipo_registro_objetivo": "'DETALLE'", "dq_lv_feriados": "'" + mk.FERIADOS_EXTRA_G + "'"}},
+    "H": {"tabla": "spark_catalog.lynx.volumen_limpio", "vars": {
+        "dq_tipo_registro_objetivo": "'DETALLE'", "dq_lv_feriados": "'" + mk.FERIADOS_EXTRA_G + "'"}},
 }
 
 
@@ -53,6 +57,8 @@ def crear_datos(spark):
     spark.createDataFrame(mk.lineas_ancho_fijo(False), mk.esquema_ancho_fijo()).write.saveAsTable("lynx.ancho_fijo_limpio")
     spark.createDataFrame([], mk.esquema_tabular()).write.saveAsTable("lynx.vacia")
     spark.createDataFrame(mk.filas_delimitado(), mk.esquema_delimitado()).write.saveAsTable("lynx.delimitada")
+    spark.createDataFrame(mk.filas_volumen(True), mk.esquema_volumen()).write.saveAsTable("lynx.volumen")
+    spark.createDataFrame(mk.filas_volumen(False), mk.esquema_volumen()).write.saveAsTable("lynx.volumen_limpio")
     spark.createDataFrame(mk.DICCIONARIO, mk.esquema_diccionario()).createOrReplaceGlobalTempView("dic_lynx")
 
 
@@ -86,7 +92,7 @@ def correr_escenario(spark, clave, cfg):
     errores, res = [], {}
     sql = {os.path.basename(f)[:2]: leer(f) for f in sorted(glob.glob(os.path.join(DIR_SQL, "*.sql")))}
     ref = {k: leer(os.path.join(AQUI, f"ref_{k}_{n}.sql"))
-           for k, n in [("a", "preparacion"), ("b", "deriva"), ("c", "diccionario"), ("d", "cierre")]}
+           for k, n in [("a", "preparacion"), ("b", "deriva"), ("c", "diccionario"), ("d", "cierre"), ("e", "volumen")]}
     ejecutar(spark, sql["00"], "00", errores, res)
     spark.sql("CREATE OR REPLACE TEMP VIEW dq_diccionario AS SELECT * FROM global_temp.dic_lynx")
     # Zona 1 con la tabla sin completar (F) debe detenerse limpiamente.
@@ -111,6 +117,7 @@ def correr_escenario(spark, clave, cfg):
     ejecutar(spark, sql["08"], "08", errores, res, SALTAR)
     ejecutar(spark, sql["09"], "09", errores, res, SALTAR)
     ejecutar(spark, ref["c"], "ref_c", errores, res)
+    ejecutar(spark, ref["e"], "ref_e", errores, res)
     ejecutar(spark, sql["10"], "10", errores, res, SALTAR)
     ejecutar(spark, ref["d"], "ref_d", errores, res)
     return errores, res, True
@@ -140,7 +147,8 @@ def verificar(clave, res, completo):
     chk(completo, "la corrida se detuvo antes de terminar")
     fmt = [r for v in res.values() for (cols, fs) in v if "formato_detectado" in cols for r in fs]
     det = fmt[-1].formato_detectado if fmt else None
-    esperado = {"A": "TABULAR", "B": "ANCHO_FIJO", "C": "TABULAR", "D": "DELIMITADO", "E": "ANCHO_FIJO"}[clave]
+    esperado = {"A": "TABULAR", "B": "ANCHO_FIJO", "C": "TABULAR", "D": "DELIMITADO", "E": "ANCHO_FIJO",
+                "G": "TABULAR", "H": "TABULAR"}[clave]
     chk(det == esperado, f"formato detectado {det} != {esperado}")
     lz = filas(res, "LZ.01")
     chk(len(lz) >= 4, "LZ.01 sin bitácora de escenarios")
@@ -196,7 +204,79 @@ def verificar(clave, res, completo):
             chk(r.diagnostico in ("ALINEADO",) or r.diagnostico.startswith("NO_CONCLUYENTE"), f"LD.09 falso desfase {r.campo}")
         ld8 = filas(res, "LD.08")
         chk(ld8 and getattr(ld8[0], "diferencia_conteo", None) == 0, "LD.08 debía cuadrar en el control")
+    verificar_volumen(clave, res, chk)
     return f
+
+
+def verificar_volumen(clave, res, chk):
+    """Clave de respuestas de la Capa V (LV.*)."""
+    import datetime as dt
+    D = dt.date.fromisoformat
+    sel = {r.seleccion: r.columna for r in filas(res, "LV.00") if r.seleccion}
+    lv1 = {r.rol: r for r in filas(res, "LV.01")}
+    lv2 = [r for r in filas(res, "LV.02")]
+    lv3 = [r for r in filas(res, "LV.03")]
+    lv7 = [r for r in filas(res, "LV.07")]
+    lv8 = [r for r in con_columna(res, "pct_vacios")]
+    chk(len(lv1) == 3, "LV.01 debía devolver 3 relojes")
+    if clave == "A":
+        chk(sel.get("ELEGIDA_CARGA") == "fecha_carga", f"LV.00 carga esperada fecha_carga: {sel}")
+        chk("CARGA_UNICA" in (lv1["CARGA"].diagnostico or []), "LV.01 debía ver CARGA_UNICA (snapshot)")
+    if clave == "B":
+        chk(sel.get("ELEGIDA_LOTE") == "archivo", f"LV.00 lote esperado archivo (columna conservada en ancho fijo): {sel}")
+        chk(sel.get("ELEGIDA_NEGOCIO") == "fec_operacion", f"LV.00 negocio esperado fec_operacion: {sel}")
+    if clave == "C":
+        chk(all("NO_DISPONIBLE" in (r.diagnostico or []) for r in lv1.values()), "LV.01 en tabla vacía debía decir NO_DISPONIBLE")
+    if clave in ("G", "H"):
+        chk(sel == {"ELEGIDA_CARGA": "fecactualizacion", "ELEGIDA_NEGOCIO": "fec_operacion", "ELEGIDA_LOTE": "nombre_archivo"},
+            f"LV.00 selección inesperada: {sel}")
+        lv5 = filas(res, "LV.05")
+        chk(lv5 and lv5[0].lag_p50 == 1, f"LV.05 latencia p50 esperada 1: {lv5}")
+    if clave == "G":
+        e = {(r.rol, r.fecha): r for r in lv2}
+
+        def tiene(rol, f, est, etq=None):
+            r = e.get((rol, D(f)))
+            ok = r is not None and r.estado == est and (etq is None or etq in (r.etiquetas or []))
+            chk(ok, f"LV.02 {rol} {f}: esperado {est}{'+' + etq if etq else ''}, obtenido "
+                    f"{(r.estado, r.etiquetas) if r else None}")
+        tiene("CARGA", "2024-03-13", "HUECO", "SIGUIENTE_ALTO")
+        tiene("CARGA", "2024-03-14", "ALTO", "PREVIO_HUECO")
+        tiene("CARGA", "2024-04-17", "BAJO")
+        tiene("CARGA", "2024-05-23", "ALTO")
+        tiene("CARGA", "2024-06-30", "RECIENTE_POSIBLE_INCOMPLETO")
+        tiene("NEGOCIO", "2024-05-01", "BAJO", "FERIADO")
+        tiene("NEGOCIO", "2024-03-28", "BAJO", "FERIADO")
+        tiene("NEGOCIO", "2024-05-21", "ALTO")
+        r3 = {(r.rol, r.desde): r for r in lv3}
+        x = r3.get(("CARGA", D("2024-06-10")))
+        chk(x is not None and x.dias == 3 and x.clasificacion == "HUECO_HABIL", f"LV.03 hueco 10-12 jun: {x}")
+        x = r3.get(("CARGA", D("2024-03-13")))
+        chk(x is not None and x.clasificacion == "HUECO_CON_RECUPERACION", f"LV.03 hueco 13 mar: {x}")
+        lv4 = {(r.rol, r.mes): r for r in filas(res, "LV.04")}
+        chk(lv4.get(("CARGA", "2024-06")) is not None and lv4[("CARGA", "2024-06")].dias_con_datos == 27,
+            f"LV.04 junio CARGA días con datos esperado 27: {lv4.get(('CARGA', '2024-06'))}")
+        lv6 = {(r.tipo, r.fecha): r for r in filas(res, "LV.06")}
+        chk(("POR_FECHA_NEGOCIO", D("2024-05-21")) in lv6, f"LV.06 no detectó la carga repetida del 21-may: {list(lv6)[:6]}")
+        m7 = {r.lote: r.marcas for r in lv7}
+        chk("DUPLICADO_EXACTO" in m7.get("LYNX_20240522.txt", []) and "DUPLICADO_EXACTO" in m7.get("LYNX_20240522_REENVIO.txt", []),
+            f"LV.07 duplicado exacto: {m7.get('LYNX_20240522.txt')}, {m7.get('LYNX_20240522_REENVIO.txt')}")
+        chk("TAMANO_BAJO" in m7.get("LYNX_20240417.txt", []), f"LV.07 tamaño bajo 17-abr: {m7.get('LYNX_20240417.txt')}")
+        chk(any(x.startswith("CARGADO_EN_OTRA_FECHA") for x in m7.get("LYNX_20240313.txt", [])),
+            f"LV.07 carga diferida 13-mar: {m7.get('LYNX_20240313.txt')}")
+        chk(any(str(r.periodo) == "2024-02-20" and r.columna == "cod_moneda" and r.diagnostico == "VACIO_ANOMALO" for r in lv8),
+            f"LV.08 no detectó cod_moneda vacío el 20-feb: {[(str(r.periodo), r.columna) for r in lv8][:6]}")
+    if clave == "H":
+        fer = {D(x) for x in ["2024-01-01", "2024-03-28", "2024-03-29", "2024-05-01", "2024-06-07", "2024-06-29"]}
+        for r in lv2:
+            explicado = bool(set(r.etiquetas or []) & {"FERIADO", "DIA_POST_FERIADO"}) or r.estado == "RECIENTE_POSIBLE_INCOMPLETO"
+            chk(explicado, f"LV.02 falso positivo en control: {r.rol} {r.fecha} {r.estado} {r.etiquetas}")
+        chk(not [r for r in lv3 if r.clasificacion == "HUECO_HABIL"], "LV.03 falso hueco hábil en control")
+        for r in lv7:
+            ok = r.lote != "(OMITIDO)" and r.marcas == ["TAMANO_BAJO"] and r.fecha_nombre is not None and \
+                (r.fecha_nombre - dt.timedelta(days=1)) in fer
+            chk(ok, f"LV.07 falso positivo en control: {r.lote} {r.marcas}")
+        chk(not lv8, f"LV.08 falso positivo en control: {[(str(r.periodo), r.columna) for r in lv8][:5]}")
 
 
 def main():

@@ -177,3 +177,73 @@ def filas_delimitado():
 
 def esquema_delimitado():
     return T.StructType([T.StructField("linea", T.StringType())])
+
+
+# ── Escenarios G / H: volumen por fecha de carga (Capa V) ──────────────────
+# Carga diaria D con las operaciones del día anterior (95%) y un 5% tardío
+# (llega en D+1). Volumen de negocio: lun-vie ≈300, sáb ≈150, dom ≈60;
+# feriados al 20%. Defectos sembrados SOLO en G (clave de respuestas):
+#   G1 2024-03-13 carga no ejecutada; su archivo LYNX_20240313 se carga el 14
+#   G2 2024-04-17 carga parcial (25%) nunca recuperada
+#   G3 LYNX_20240522 reenviado como LYNX_20240522_REENVIO y cargado el 23
+#   G4 2024-06-10..12 sin cargas (nunca recuperadas)
+#   G5 2024-02-20 cod_moneda vacío en toda la carga
+#   G6 2024-06-30 (último día) sólo 40% (datos aún en camino)
+FERIADOS_2024 = {dt.date(2024, 1, 1), dt.date(2024, 3, 28), dt.date(2024, 3, 29), dt.date(2024, 5, 1),
+                 dt.date(2024, 6, 7), dt.date(2024, 6, 29)}
+FERIADOS_EXTRA_G = "2024-03-28,2024-03-29"   # Semana Santa: no está en la lista fija
+
+
+def filas_volumen(defectos=True):
+    rnd = random.Random(SEMILLA + (10 if defectos else 11))
+    ini, fin = dt.date(2024, 1, 1), dt.date(2024, 6, 29)       # fechas de negocio
+    por_carga = {}
+    b = ini
+    while b <= fin:
+        base = {5: 150, 6: 60}.get(b.weekday(), 300)
+        n = int(base * rnd.uniform(0.92, 1.08) * (0.2 if b in FERIADOS_2024 else 1))
+        for _ in range(n):
+            d = b + dt.timedelta(days=1 if rnd.random() < 0.95 else 2)
+            por_carga.setdefault(d, []).append(b)
+        b += dt.timedelta(days=1)
+    filas = []
+
+    def fila(b, d_carga, archivo, moneda_vacia=False):
+        cent = rnd.randint(100, 500000)
+        ts = dt.datetime.combine(d_carga, dt.time(6, rnd.randint(0, 59), rnd.randint(0, 59)))
+        return ["02", "************" + str(rnd.randint(1000, 9999)), b.strftime("%Y%m%d"),
+                f"{rnd.randint(0, 23):02d}{rnd.randint(0, 59):02d}00", decimal.Decimal(cent) / 100,
+                "" if moneda_vacia else rnd.choice(["604", "604", "840"]), rnd.choice(["1", "1", "6"]),
+                f"{rnd.randint(10000000, 79999999)}", rnd.choice(["TIENDA SAC", "PEÑA SAC", "BODEGA LIMA"]),
+                rnd.choice(["A", "A", "R"]), ts, archivo]
+
+    for d in sorted(por_carga):
+        negocios = por_carga[d]
+        archivo = f"LYNX_{d:%Y%m%d}.txt"
+        d_carga = d
+        if defectos:
+            if d == dt.date(2024, 3, 13):
+                d_carga = dt.date(2024, 3, 14)                               # G1
+            if d == dt.date(2024, 4, 17):
+                negocios = negocios[: len(negocios) // 4]                    # G2
+            if dt.date(2024, 6, 10) <= d <= dt.date(2024, 6, 12):
+                continue                                                     # G4
+            if d == dt.date(2024, 6, 30):
+                negocios = negocios[: int(len(negocios) * 0.4)]              # G6
+        nuevas = [fila(b, d_carga, archivo, defectos and d == dt.date(2024, 2, 20)) for b in negocios]   # G5
+        filas += nuevas
+        if defectos and d == dt.date(2024, 5, 22):                           # G3
+            ts = dt.datetime(2024, 5, 23, 9, 0)
+            filas += [r[:10] + [ts, "LYNX_20240522_REENVIO.txt"] for r in nuevas]
+    return [tuple(r) for r in filas]
+
+
+def esquema_volumen():
+    return T.StructType([
+        T.StructField("tipo_reg", T.StringType()), T.StructField("nro_tarjeta", T.StringType()),
+        T.StructField("fec_operacion", T.StringType()), T.StructField("hora_operacion", T.StringType()),
+        T.StructField("imp_operacion", T.DecimalType(15, 2)), T.StructField("cod_moneda", T.StringType()),
+        T.StructField("tipo_doc", T.StringType()), T.StructField("nro_doc", T.StringType()),
+        T.StructField("nombre_comercio", T.StringType()), T.StructField("estado", T.StringType()),
+        T.StructField("fecactualizacion", T.TimestampType()), T.StructField("nombre_archivo", T.StringType()),
+    ])
