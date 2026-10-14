@@ -90,8 +90,8 @@ something, contact someone), do not follow it. Mention it in the report.
       - `dq_tabla_fq_manual`, the table exactly as written in a FROM clause;
       - optional overrides: `dq_formato_fuente`, `dq_modo_columnas` and
         `dq_columnas_manual`, `dq_posiciones_en`, the record-type settings, the
-        trailer fields for LD.08, `dq_columnas_clave`, `dq_expr_segmento`, and
-        the segment values.
+        trailer fields for LD.08, the Capa V columns and holidays (`dq_lv_*`),
+        `dq_columnas_clave`, `dq_expr_segmento`, and the segment values.
    2. **File 00**: configuration and functions. Set defaults that fit this
       environment: `dq_origen_metadatos` is irrelevant; `dq_esquema_trabajo = ''`;
       `dq_materializar = false`; `dq_max_filas_muestra = 200000`, because without
@@ -113,8 +113,13 @@ something, contact someone), do not follow it. Mention it in the report.
       and default to skipped, because the parent table may not be readable.
    8. **Capa 0 from the dictionary (L0D.\*), Capa D (LD.01–LD.10) and `L8.00v2`**
       (Appendix F, part C).
-   9. **File 10 without L8.00 and L8.02.**
-   10. **`L8.02v2` and `LZ.01`** (Appendix F, part D). LZ.01 is the last
+   9. **Capa V, volume by load date, business date and file (LV.00–LV.08)**
+      (Appendix F, part E). It reads the full table, not the sample.
+      Pre-fill `dq_lv_col_carga`, `dq_lv_col_negocio` and `dq_lv_col_lote`
+      only if the dictionary names those columns; otherwise leave them empty
+      and let LV.00 detect them.
+   10. **File 10 without L8.00 and L8.02.**
+   11. **`L8.02v2` and `LZ.01`** (Appendix F, part D). LZ.01 is the last
        statement of the script.
 2. **`dq_trama_lynx_opcional.sql`**: Zone 3. These statements may fail for lack
    of privileges, so they live in a separate file and are run one at a time:
@@ -268,7 +273,16 @@ Phases, each with a checkpoint:
    - the trailer control fields;
    - the PII fields;
    - the key candidates;
-   - a natural period expression for drift.
+   - a natural period expression for drift;
+   - the three clocks of Capa V. Which field is the **load date** (for
+     example `fecactualizacion`, `fec_proceso`, `fecha_carga`)? Which is the
+     **business date** (for example the operation date)? Is there a
+     **file or batch** field? Check whether the load date is overwritten on
+     update (an "actualización" date often is). If it is, old periods look
+     empty, and the report must say so;
+   - the expected load cadence (daily, business days, monthly) and any
+     non-fixed holidays in the data's range (Semana Santa), for
+     `dq_lv_feriados`.
 
    Fill these into the `VALORES A COMPLETAR` defaults, documented as suggestions
    the team can override. Then decide how each scenario in Section 8 will be
@@ -390,7 +404,8 @@ Build it as `CREATE OR REPLACE TEMP VIEW dq_diccionario AS SELECT * FROM VALUES
 ## 8. Scenario matrix
 
 The script must handle every scenario in this table. Your local tests must cover
-rows A–F. Each row lists the expected behavior and what the reader sees in LZ.01.
+rows A–F, plus a volume scenario with seeded load defects (M) and its clean
+control (Appendix G, scenarios G and H). Each row lists the expected behavior and what the reader sees in LZ.01.
 
 | # | Scenario | How the script detects it | Expected behavior | Interpretation shown to the reader |
 |---|---|---|---|---|
@@ -406,6 +421,9 @@ rows A–F. Each row lists the expected behavior and what the reader sees in LZ.
 | J | Several record types mixed in one column, but no record-type position configured | Many line-length groups in LD.07 | Profiles all lines together, and LD.07 shows the mix | Configure `dq_pos_tipo_registro` and `dq_len_tipo_registro`. |
 | K | The dictionary counts positions in bytes and the data has `ñ` or accents | LD.09 shows a shift only in the "multibyte" group | Explains the shift | Set `dq_posiciones_en = 'BYTES'`. |
 | L | The team's account can, in fact, read `information_schema` | Optional file works | Core unchanged | The optional file adds the inventory and the declared foreign keys. |
+| M | The table has a load date (`fecactualizacion`, `fecha_carga`…), a business date and/or a file-name column | LV.00 (type, dictionary family, name regexes) | Daily and monthly series per clock on the full table. Holes, drops and spikes are judged against the same weekday's median. Gap runs, latency, reloads, per-file size, duplicate files, and columns that empty out in one load (LV.01–LV.08). | Each day or file flag comes with its competing causes: deferred load, partial file, duplicate resend, holiday, data still arriving. |
+| N | The load date is overwritten on every update (SCD1), or the table is a full snapshot | LV.01 `CONCENTRADO_RECIENTE` / `CARGA_UNICA` | Volume by load date is reported, but flagged as not meaningful | Old "holes" are not failed loads. Use the business-date clock. |
+| O | No time or file column at all | LV.00 finds no candidates | Capa V returns explanatory rows only, and logs `VOLUMEN_SIN_COLUMNA_DE_TIEMPO` | Ask data engineering for the audit column. |
 
 </scenarios>
 
@@ -429,6 +447,9 @@ never state one cause as fact when another is plausible.
 | Trailer count does not match | incomplete or duplicated load / row filter / trailer computed wrong / several files concatenated | number of trailers; the per-file breakdown (if there is a file column); L1.05 duplicates |
 | A column has a single value or matches a mask pattern | Unity Catalog column mask / tokenization / field not filled / constant by design | LD.10; a domain of size 1 in the dictionary |
 | Empty table | load not run / row filter / wrong target record type | LD.07 counts per record code on the raw table |
+| A day or month with few or no rows | failed or partial load / deferred load (recovered the next day) / holiday or real low activity / data still arriving / the load date is overwritten (SCD1) / row filter | which clock shows it (load vs business date); `SIGUIENTE_ALTO`/`PREVIO_HUECO` in LV.02; the `FERIADO` tag; LV.05 latency p90; LV.01 `CONCENTRADO_RECIENTE`; LV.07 file size against the trailer (LD.08) |
+| A day or file with too many rows | duplicate resend / recovery of a previous hole / backfill / real event | LV.07 `DUPLICADO_EXACTO`; LV.06 business dates spread across loads; LV.02 `PREVIO_HUECO`; L1.05 duplicates |
+| A column empty only in some loads | field not sent or mis-mapped in that load / layout change / source had no data | LV.08 for one column vs many columns in the same period; LD.09; the change log |
 
 In the report, attach a confidence level to every finding: **ALTA, MEDIA or
 BAJA**. Also include an "Escenarios y explicaciones alternativas" section that
@@ -579,6 +600,10 @@ Local Spark cannot emulate Unity Catalog permissions, column masks, row filters,
 - [ ] Do skipped sections still create their views with the right columns?
 - [ ] Are PII values masked in every output that shows values?
 - [ ] Can a reader understand from LZ.01 alone which scenario ran?
+- [ ] Does any volume finding (LV.\*) blame a load failure when a holiday,
+      data still arriving, a deferred load, or an overwritten load date would
+      explain it equally well? Is the clock (load vs business date) always
+      stated?
 - [ ] Do the docstrings and tooltips say anything that the SQL does not actually
       do?
 - [ ] Do the report's claims all match evidence from this session?
@@ -615,7 +640,11 @@ Local Spark cannot emulate Unity Catalog permissions, column masks, row filters,
      `information_schema` or `DESCRIBE` (Unity Catalog lets non-admins see
      metadata for objects they have privileges on, so the optional file may
      work);
-   - the real table name and the file or partition column, if there is one.
+   - the real table name and the file or partition column, if there is one;
+   - which column records the load date (for example `fecactualizacion`),
+     whether it is overwritten when a record is updated, the expected load
+     calendar (daily, business days only), and the known incidents in the
+     period (so LV.02 findings can be confirmed or dismissed).
 
 Writing style:
 - lead with the outcome;
@@ -663,7 +692,7 @@ Expected IDs in `patrones.txt`, by file, with the action to take:
 | 03 Capa 1 | L1.00–L1.09 | **Keep.** L1.07 and L1.08 use `dq_columnas_clave`. In fixed-width mode the column names are the normalized field names (`dq_norm(campo)`). |
 | 04 Capa 2 | L2.00a–L2.08 | **Keep.** Extend the semantic types if the trama needs it. |
 | 05 Capa 3 | L3.00–L3.07 | **Keep.** |
-| 06 Capa 4 | L4.00–L4.06 | **Keep.** |
+| 06 Capa 4 | L4.00–L4.06 | **Keep.** They profile date *values* on the sample. Volume by period is answered by Capa V (LV.\*) on the full table: say so in the L4.02–L4.04 tooltips (`[ADAPTADO]`). |
 | 07 Capa 5 | L5.00–L5.06 | **Keep.** |
 | 08 Capa 6 | L6.00 | **Replace** with L6.00v2. |
 | 08 Capa 6 | L6.00b–L6.06 | **Keep.** |
@@ -672,7 +701,7 @@ Expected IDs in `patrones.txt`, by file, with the action to take:
 | 10 Capa 8 | L8.00 | **Replace** with L8.00v2, which is generated from the dictionary. |
 | 10 Capa 8 | L8.01, L8.03–L8.10 | **Keep.** |
 | 10 Capa 8 | L8.02 | **Replace** with L8.02v2 (PII masked). |
-| new | Z1.01–Z1.03, Z2.01–Z2.04, P2.01v2–P2.03v2, L0D.01–L0D.02, LD.01–LD.10, L6.00v2, L8.00v2, L8.02v2, LZ.01 | **Add** from Appendix F. |
+| new | Z1.01–Z1.03, Z2.01–Z2.04, P2.01v2–P2.03v2, L0D.01–L0D.02, LD.01–LD.10, LV.00–LV.08, L6.00v2, L8.00v2, L8.02v2, LZ.01 | **Add** from Appendix F. |
 
 **Query names, by file**
 
@@ -735,6 +764,9 @@ the team may set in `VALORES A COMPLETAR`:
 | `dq_tipo_registro_objetivo`, `dq_pos_tipo_registro`, `dq_len_tipo_registro` | '' / 0 / 0 | The record type to profile, and where its code is in the line. |
 | `dq_ld_tipo_trailer`, `dq_ld_campo_conteo`, `dq_ld_campo_suma_trailer`, `dq_ld_campo_suma_detalle` | '' | Trailer control fields for LD.08. |
 | `dq_mostrar_pii` | false | Leave it false unless authorized. |
+| `dq_lv_col_carga`, `dq_lv_col_negocio`, `dq_lv_col_lote` | '' | Load-date, business-date and file/batch columns for Capa V. '' = auto-detection (LV.00 shows what it chose). |
+| `dq_lv_feriados` | '' | Extra holidays `'AAAA-MM-DD,…'` (Semana Santa, one-off holidays). The fixed Peruvian holidays are built in. |
+| `dq_lv_umbral_bajo`, `dq_lv_umbral_alto`, `dq_lv_dias_recientes`, `dq_lv_granularidad`, `dq_lv_activo` | 0.5 / 1.6 / 3 / AUTO / true | Day-level thresholds against the same-weekday median; recent days treated as "still arriving"; period for LV.08; switch for the whole layer. |
 | `dq_columnas_clave`, `dq_expr_segmento`, `dq_segmento_base`, `dq_segmento_actual` | '' / NULL / '' / '' | Key, period expression and segment values. In fixed-width mode, refer to the normalized field names. |
 | `dq_max_filas_muestra` | 200000 | Sample size for the profiling layers. Rules and control totals always use the full table. |
 
@@ -792,10 +824,10 @@ Rules are generated only for fields with `estado = 'MAPEADO'`. Fields mapped wit
 
 ## Appendix F: Reference implementation (tested)
 
-These four parts were tested on Spark 4.2, ANSI on and off, against scenarios A–F
+These five parts were tested on Spark 4.2, ANSI on and off, against scenarios A–H
 with a synthetic Lynx-like trama and seeded defects (Appendix G). They assume
 files 00 and 02–10 of the framework are in the same session, in the order of
-Section 3.
+Section 3 (part E goes after part C).
 
 Reuse them as the starting point. Adapt names, synonyms, formats and the
 record-type position to the real dictionary, keep the patterns, and mark your
@@ -839,6 +871,21 @@ changes with `[ADAPTADO]`.
      dq_mostrar_pii      : false = los ejemplos de campos PII salen enmascarados.
      dq_ld_*             : campos del trailer para los totales de control [LD.08].
      dq_estado / dq_log  : estado de la corrida y bitácora de escenarios.
+     dq_lv_*             : Capa V (volumen por fecha de carga, de negocio y
+                           por archivo/lote) [LV.00-LV.08]:
+       dq_lv_activo : false apaga la capa (cada consulta LV lee la tabla
+         completa; útil si la tabla es enorme).
+       dq_lv_col_carga / dq_lv_col_negocio / dq_lv_col_lote : columnas a usar
+         (p.ej. 'fecactualizacion', 'fec_operacion', 'nombre_archivo'); ''
+         = autodetección por tipo y nombre (regex dq_lv_regex_*).
+       dq_lv_umbral_bajo / dq_lv_umbral_alto : razón vs. la mediana del mismo
+         día de semana (8 semanas previas) para marcar BAJO / ALTO.
+       dq_lv_dias_recientes : últimos días que pueden estar incompletos
+         (datos que aún no llegan); se marcan aparte, no como falla.
+       dq_lv_feriados : feriados adicionales 'AAAA-MM-DD,…' (p.ej. Jueves y
+         Viernes Santo, feriados puntuales); los fijos de Perú ya vienen.
+       dq_lv_granularidad : 'AUTO' (DIA si el rango ≤ 400 días, si no MES),
+         'DIA' o 'MES' para la deriva de vacíos por periodo [LV.08].
    TOOLTIP ▸ Cómo interpretar
      • No devuelve filas. Todo lo que el script decida queda en dq_log; al
        final [LZ.01] lo muestra completo con su interpretación.
@@ -856,6 +903,17 @@ DECLARE OR REPLACE VARIABLE dq_ld_tipo_trailer        STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_ld_campo_conteo        STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_ld_campo_suma_trailer  STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_ld_campo_suma_detalle  STRING  DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_lv_activo              BOOLEAN DEFAULT true;
+DECLARE OR REPLACE VARIABLE dq_lv_col_carga           STRING  DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_lv_col_negocio         STRING  DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_lv_col_lote            STRING  DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_lv_regex_carga         STRING  DEFAULT '(?i)(actualiz|fec_?act|f_?act|carga|cargue|proces|ingest|load|insert|upd|modif|audit|etl|corte|snapshot|extrac)';
+DECLARE OR REPLACE VARIABLE dq_lv_regex_lote          STRING  DEFAULT '(?i)(archivo|arch|file|lote|batch|origen|source|path|ruta)';
+DECLARE OR REPLACE VARIABLE dq_lv_umbral_bajo         DOUBLE  DEFAULT 0.5;
+DECLARE OR REPLACE VARIABLE dq_lv_umbral_alto         DOUBLE  DEFAULT 1.6;
+DECLARE OR REPLACE VARIABLE dq_lv_dias_recientes      INT     DEFAULT 3;
+DECLARE OR REPLACE VARIABLE dq_lv_feriados            STRING  DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_lv_granularidad        STRING  DEFAULT 'AUTO';
 DECLARE OR REPLACE VARIABLE dq_estado                 STRING  DEFAULT 'OK';
 DECLARE OR REPLACE VARIABLE dq_log ARRAY<STRUCT<paso STRING, escenario STRING, detalle STRING, interpretacion STRING>>
   DEFAULT CAST(array() AS ARRAY<STRUCT<paso STRING, escenario STRING, detalle STRING, interpretacion STRING>>);
@@ -870,6 +928,8 @@ DECLARE OR REPLACE VARIABLE dq_pct_delim_estable      DOUBLE  DEFAULT 0;
 DECLARE OR REPLACE VARIABLE dq_largos_esperados       STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_codigo_registro_obj    STRING  DEFAULT '';
 DECLARE OR REPLACE VARIABLE dq_n_filas_acceso         BIGINT  DEFAULT 0;
+DECLARE OR REPLACE VARIABLE dq_cols_extra_a           STRING  DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_cols_extra_b           STRING  DEFAULT '';
 
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -1179,6 +1239,9 @@ SELECT dq_formato_detectado AS formato_detectado, round(dq_pct_match, 4) AS pct_
          fallar decode()), sobre la línea sin BOM ni \r final; más _dq_linea y
          _dq_tipo_registro. Nombres = dq_norm(campo) (+ sufijo si se repite).
        DELIMITADO : una columna por campo, por orden del diccionario.
+       En ambos casos se conservan las demás columnas de la tabla (p.ej.
+       archivo, fecha de carga, fecactualizacion) con su nombre original, o
+       con sufijo _origen si chocan con un campo: la Capa V las necesita.
      También crea dq_mapa (campo → columna en dq_objetivo + atributos del
      diccionario + tipo real) que usan la Capa D y las reglas.
    TOOLTIP ▸ Cómo interpretar
@@ -1186,15 +1249,33 @@ SELECT dq_formato_detectado AS formato_detectado, round(dq_pct_match, 4) AS pct_
        perfilado (dq_regex_excluir_columnas).
      • En ANCHO_FIJO los valores NO se recortan: el relleno se evalúa en [LD.03].
    ──────────────────────────────────────────────────────────────────────────── */
+SET VAR dq_cols_extra_a = coalesce((
+  SELECT array_join(transform(array_sort(collect_list(struct(ordinal, e))), x -> x.e), '')
+  FROM (SELECT x.ordinal, concat(', ', dq_id(x.columna), ' AS ',
+                                 dq_id(IF(p.nombre IS NULL, x.columna, concat(x.columna, '_origen')))) AS e
+        FROM dq_cols_reales x
+        LEFT JOIN (SELECT DISTINCT lower(dq_norm(campo)) AS nombre FROM dq_diccionario
+                   WHERE dq_tipo_registro_objetivo = '' OR tipo_registro = dq_tipo_registro_objetivo) p
+          ON p.nombre = lower(x.columna)
+        WHERE x.columna <> dq_col_linea AND NOT lower(x.columna) RLIKE '^_dq_')), '');
+SET VAR dq_cols_extra_b = coalesce((
+  SELECT array_join(transform(array_sort(collect_list(struct(ordinal, e))), x -> x.e), '')
+  FROM (SELECT x.ordinal, concat(', ', dq_id(IF(p.nombre IS NULL, x.columna, concat(x.columna, '_origen')))) AS e
+        FROM dq_cols_reales x
+        LEFT JOIN (SELECT DISTINCT lower(dq_norm(campo)) AS nombre FROM dq_diccionario
+                   WHERE dq_tipo_registro_objetivo = '' OR tipo_registro = dq_tipo_registro_objetivo) p
+          ON p.nombre = lower(x.columna)
+        WHERE x.columna <> dq_col_linea AND NOT lower(x.columna) RLIKE '^_dq_')), '');
+
 SET VAR dq_sql = CASE
   WHEN dq_formato_detectado = 'ANCHO_FIJO' THEN coalesce((
     SELECT concat(
       'CREATE OR REPLACE TEMP VIEW dq_objetivo AS SELECT ',
       array_join(transform(array_sort(collect_list(struct(orden, e))), x -> x.e), ', '),
-      ', _dq_linea, _dq_tipo_registro FROM (SELECT l AS _dq_linea, ',
+      ', _dq_linea, _dq_tipo_registro', dq_cols_extra_b, ' FROM (SELECT l AS _dq_linea, ',
       IF(dq_len_tipo_registro > 0, concat('substr(l, ', dq_pos_tipo_registro, ', ', dq_len_tipo_registro, ')'), 'CAST(NULL AS STRING)'),
-      ' AS _dq_tipo_registro FROM (SELECT regexp_replace(regexp_replace(', dq_id(dq_col_linea), ', ',
-      dq_lit('^\\x{FEFF}'), ', ', dq_lit(''), '), ', dq_lit('\\r$'), ', ', dq_lit(''), ') AS l FROM ', dq_tabla_fq_manual,
+      ' AS _dq_tipo_registro', dq_cols_extra_b, ' FROM (SELECT regexp_replace(regexp_replace(', dq_id(dq_col_linea), ', ',
+      dq_lit('^\\x{FEFF}'), ', ', dq_lit(''), '), ', dq_lit('\\r$'), ', ', dq_lit(''), ') AS l', dq_cols_extra_a, ' FROM ', dq_tabla_fq_manual,
       ' WHERE ', dq_id(dq_col_linea), ' IS NOT NULL) a) b',
       IF(dq_len_tipo_registro > 0 AND dq_codigo_registro_obj <> '',
          concat(' WHERE _dq_tipo_registro = ', dq_lit(dq_codigo_registro_obj)), ''))
@@ -1214,9 +1295,9 @@ SET VAR dq_sql = CASE
     SELECT concat(
       'CREATE OR REPLACE TEMP VIEW dq_objetivo AS SELECT ',
       array_join(transform(array_sort(collect_list(struct(orden, e))), x -> x.e), ', '),
-      ', _dq_linea FROM (SELECT ', dq_id(dq_col_linea), ' AS _dq_linea, split(', dq_id(dq_col_linea), ', ',
+      ', _dq_linea', dq_cols_extra_b, ' FROM (SELECT ', dq_id(dq_col_linea), ' AS _dq_linea, split(', dq_id(dq_col_linea), ', ',
       CASE dq_delimitador WHEN 'TAB' THEN 'chr(9)' WHEN '|' THEN dq_lit('[|]') ELSE dq_lit(dq_delimitador) END,
-      ') AS _dq_partes FROM ', dq_tabla_fq_manual, ') a')
+      ') AS _dq_partes', dq_cols_extra_a, ' FROM ', dq_tabla_fq_manual, ') a')
     FROM (SELECT orden, concat('try_element_at(_dq_partes, ', CAST(rn AS STRING), ') AS ', dq_id(nombre)) AS e
           FROM (SELECT orden, row_number() OVER (ORDER BY orden) AS rn,
                        concat(dq_norm(campo), IF(row_number() OVER (PARTITION BY dq_norm(campo) ORDER BY orden) > 1,
@@ -1996,6 +2077,758 @@ SELECT 999, 'FINAL', dq_estado,
 ORDER BY n;
 ```
 
+### Part E: Capa V: volume by load date, business date and file (LV.00–LV.08); place it after part C
+
+```sql
+/* ════════════════════════════════════════════════════════════════════════════
+   REFERENCIA E · CAPA V: VOLUMEN POR PERIODO, FECHA DE CARGA Y ARCHIVO
+   ────────────────────────────────────────────────────────────────────────────
+   DOCSTRING (es-PE)
+     Analiza CUÁNTAS filas llegan por día, por mes y por archivo/lote, para
+     detectar cargas fallidas, parciales, duplicadas o tardías. Distingue
+     tres "relojes":
+       CARGA   : cuándo se cargó la fila (fecactualizacion, fecha_carga,
+                 fec_proceso, timestamp de ingesta…).
+       NEGOCIO : cuándo ocurrió el hecho (fecha de operación).
+       LOTE    : el archivo o lote de origen (y la fecha en su nombre).
+     A diferencia de L4.02-L4.04 (que trabajan sobre la MUESTRA dq_long),
+     esta capa lee la tabla COMPLETA (dq_objetivo): un día con pocas filas
+     no desaparece por muestreo. Cada consulta re-lee la tabla; si es muy
+     grande y no necesitan esta capa, pongan dq_lv_activo = false.
+     Requiere: P2.01v2-P2.03v2 (dq_objetivo, dq_columnas) y dq_mapa.
+   TOOLTIP ▸ Cómo leer la capa (orden sugerido)
+     • LV.00 qué columnas eligió (o por qué no hay) → LV.01 resumen y
+       frescura → LV.02 días anómalos → LV.03 huecos → LV.04 meses →
+       LV.05/LV.06 latencia y recargas → LV.07 archivos → LV.08 columnas que
+       se vacían en una carga.
+     • Ningún hallazgo de volumen es por sí solo un error de datos: cada
+       fila trae la columna hipotesis con las causas en orden de
+       probabilidad y la consulta que permite distinguirlas.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+   [LV.00] Columnas de tiempo y lote: candidatas, estadísticas y selección
+   DOCSTRING (es-PE)
+     Busca columnas candidatas en dq_objetivo: tipo DATE/TIMESTAMP, campo
+     FECHA del diccionario, o nombre que sugiere fecha, carga o archivo
+     (dq_lv_regex_carga, dq_lv_regex_lote). Asigna un rol (CARGA, NEGOCIO,
+     LOTE), mide en UNA lectura de la tabla cuántos valores se convierten a
+     fecha válida (1950 a hoy + 1 año) y elige una columna por rol:
+       • si el equipo fijó dq_lv_col_* y la columna existe, se usa ésa;
+       • si no, la de ≥ 90% de fechas válidas con más días distintos
+         (CARGA prefiere TIMESTAMP; NEGOCIO prefiere campos del diccionario).
+     En la columna LOTE la fecha se extrae del nombre (AAAAMMDD en el texto).
+     Crea dq_lv_base (dq_objetivo + _dq_lv_f_carga, _dq_lv_f_negocio,
+     _dq_lv_lote, _dq_lv_f_lote, _dq_lv_hash, _dq_lv_f_serie) y las vistas
+     dq_lv_eventos, dq_lv_diario y dq_lv_serie que usa el resto de la capa.
+   TOOLTIP ▸ Cómo leer e interpretar (hipótesis alternativas)
+     • seleccion = ELEGIDA_<rol> indica la columna usada. Si eligió mal (p.ej.
+       tomó fec_proceso como CARGA cuando es fecha de negocio), fijen
+       dq_lv_col_carga / dq_lv_col_negocio / dq_lv_col_lote y vuelvan a
+       correr desde LV.00.
+     • pct_fecha_valida bajo en una candidata: 1) no es una fecha (código,
+       periodo AAAAMM), 2) formato distinto al esperado (revisen el formato
+       en el diccionario o dq_orden_fecha_texto), 3) centinelas o basura.
+     • Sin ninguna candidata CARGA ni LOTE: la tabla no trae trazabilidad de
+       carga; la capa se limita a la fecha de negocio. Pidan a ingeniería de
+       datos la columna de auditoría (fecha de carga o nombre de archivo).
+   ──────────────────────────────────────────────────────────────────────────── */
+DECLARE OR REPLACE VARIABLE dq_lv_cands ARRAY<STRUCT<columna STRING, q STRING, lit STRING, familia STRING, rol STRING,
+  en_diccionario BOOLEAN, expr STRING, expr_ts STRING>>
+  DEFAULT CAST(array() AS ARRAY<STRUCT<columna STRING, q STRING, lit STRING, familia STRING, rol STRING,
+  en_diccionario BOOLEAN, expr STRING, expr_ts STRING>>);
+DECLARE OR REPLACE VARIABLE dq_lv_stats ARRAY<STRUCT<columna STRING, n_no_nulos BIGINT, n_fecha BIGINT,
+  n_fecha_valida BIGINT, f_min DATE, f_max DATE, n_dias BIGINT, n_distintos BIGINT>>
+  DEFAULT CAST(array() AS ARRAY<STRUCT<columna STRING, n_no_nulos BIGINT, n_fecha BIGINT,
+  n_fecha_valida BIGINT, f_min DATE, f_max DATE, n_dias BIGINT, n_distintos BIGINT>>);
+DECLARE OR REPLACE VARIABLE dq_lv_rol_serie STRING DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_lv_manual_invalidas STRING DEFAULT '';
+DECLARE OR REPLACE VARIABLE dq_lv_rango_dias INT DEFAULT 0;
+
+SET VAR dq_lv_cands = (
+  SELECT collect_list(named_struct('columna', columna, 'q', q, 'lit', lit, 'familia', familia, 'rol', rol,
+                                   'en_diccionario', en_diccionario, 'expr', expr, 'expr_ts', expr_ts))
+  FROM (
+    SELECT columna, q, lit, familia, rol, en_diccionario,
+           CASE WHEN rol = 'LOTE' AND familia NOT IN ('FECHA', 'TIMESTAMP')
+                  THEN concat('dq_fecha_formato(regexp_extract(CAST(', q, ' AS STRING), ',
+                              dq_lit('(20[0-9]{2}[01][0-9][0-3][0-9])'), ', 1), ', dq_lit('AAAAMMDD'), ')')
+                WHEN familia IN ('FECHA', 'TIMESTAMP') THEN concat('CAST(', q, ' AS DATE)')
+                WHEN coalesce(formato, '') <> ''
+                  THEN concat('dq_fecha_formato(CAST(', q, ' AS STRING), ', dq_lit(formato), ')')
+                ELSE concat('coalesce(dq_fecha_formato(CAST(', q, ' AS STRING), ', dq_lit('AAAAMMDD'), '), ',
+                            'dq_fecha_texto(CAST(', q, ' AS STRING), ', dq_lit(dq_orden_fecha_texto), '))') END AS expr,
+           IF(familia = 'TIMESTAMP', concat('CAST(', q, ' AS TIMESTAMP)'), 'CAST(NULL AS TIMESTAMP)') AS expr_ts
+    FROM (
+      SELECT c.columna, dq_id(c.columna) AS q, dq_lit(c.columna) AS lit, c.familia, c.ordinal,
+             m.campo IS NOT NULL AS en_diccionario, m.formato,
+             CASE WHEN c.columna = dq_lv_col_lote THEN 'LOTE'
+                  WHEN c.columna = dq_lv_col_carga THEN 'CARGA'
+                  WHEN c.columna = dq_lv_col_negocio THEN 'NEGOCIO'
+                  WHEN c.familia = 'TEXTO' AND c.columna RLIKE dq_lv_regex_lote
+                       AND NOT c.columna RLIKE '(?i)(fec|fch|fecha|date)' THEN 'LOTE'
+                  WHEN c.columna RLIKE dq_lv_regex_carga THEN 'CARGA'
+                  ELSE 'NEGOCIO' END AS rol
+      FROM dq_columnas c
+      LEFT JOIN (SELECT columna, max(campo) AS campo, max(formato) AS formato, max(familia_declarada) AS familia_declarada
+                 FROM dq_mapa WHERE estado = 'MAPEADO' GROUP BY columna) m ON m.columna = c.columna
+      WHERE c.columna IS NOT NULL
+        AND coalesce(c.familia, 'OTRO') NOT IN ('BOOLEANO', 'BINARIO', 'COMPLEJO', 'INTERVALO')
+        AND (c.familia IN ('FECHA', 'TIMESTAMP') OR m.familia_declarada = 'FECHA'
+             OR c.columna RLIKE dq_lv_regex_carga OR c.columna RLIKE dq_lv_regex_lote
+             OR c.columna RLIKE '(?i)(fec|fch|fecha|date|_dt$|^dt_|periodo)'
+             OR c.columna IN (dq_lv_col_carga, dq_lv_col_negocio, dq_lv_col_lote))
+      ORDER BY CASE WHEN c.columna IN (dq_lv_col_carga, dq_lv_col_negocio, dq_lv_col_lote) THEN 0 ELSE 1 END, c.ordinal
+      LIMIT 40) a));
+
+SET VAR dq_lv_manual_invalidas = concat_ws(', ',
+  IF(dq_lv_col_carga <> '' AND NOT exists(dq_lv_cands, x -> x.columna = dq_lv_col_carga), dq_lv_col_carga, NULL),
+  IF(dq_lv_col_negocio <> '' AND NOT exists(dq_lv_cands, x -> x.columna = dq_lv_col_negocio), dq_lv_col_negocio, NULL),
+  IF(dq_lv_col_lote <> '' AND NOT exists(dq_lv_cands, x -> x.columna = dq_lv_col_lote), dq_lv_col_lote, NULL));
+
+SET VAR dq_sql = IF(size(dq_lv_cands) = 0 OR NOT dq_lv_activo,
+  'SELECT CAST(array() AS ARRAY<STRUCT<columna STRING, n_no_nulos BIGINT, n_fecha BIGINT, n_fecha_valida BIGINT, f_min DATE, f_max DATE, n_dias BIGINT, n_distintos BIGINT>>)',
+  concat(
+    'SELECT collect_list(named_struct(\'columna\', columna, \'n_no_nulos\', n_no_nulos, \'n_fecha\', n_fecha, ',
+    '\'n_fecha_valida\', n_fecha_valida, \'f_min\', f_min, \'f_max\', f_max, \'n_dias\', n_dias, \'n_distintos\', n_distintos)) ',
+    'FROM (SELECT stack(', CAST(size(dq_lv_cands) AS STRING), ', ',
+    array_join(transform(dq_lv_cands, (x, i) -> concat(x.lit,
+      ', n', CAST(i AS STRING), ', f', CAST(i AS STRING), ', v', CAST(i AS STRING), ', mn', CAST(i AS STRING),
+      ', mx', CAST(i AS STRING), ', d', CAST(i AS STRING), ', r', CAST(i AS STRING))), ', '),
+    ') AS (columna, n_no_nulos, n_fecha, n_fecha_valida, f_min, f_max, n_dias, n_distintos) FROM (SELECT ',
+    array_join(transform(dq_lv_cands, (x, i) -> concat(
+      'count(_c', CAST(i AS STRING), ') AS n', CAST(i AS STRING),
+      ', count(_e', CAST(i AS STRING), ') AS f', CAST(i AS STRING),
+      ', count_if(_e', CAST(i AS STRING), ' BETWEEN DATE\'1950-01-01\' AND date_add(current_date(), 366)) AS v', CAST(i AS STRING),
+      ', min(_e', CAST(i AS STRING), ') AS mn', CAST(i AS STRING),
+      ', max(_e', CAST(i AS STRING), ') AS mx', CAST(i AS STRING),
+      ', approx_count_distinct(_e', CAST(i AS STRING), ') AS d', CAST(i AS STRING),
+      ', approx_count_distinct(_c', CAST(i AS STRING), ') AS r', CAST(i AS STRING))), ', '),
+    ' FROM (SELECT ',
+    array_join(transform(dq_lv_cands, (x, i) -> concat(x.expr, ' AS _e', CAST(i AS STRING), ', ', x.q, ' AS _c', CAST(i AS STRING))), ', '),
+    ' FROM dq_objetivo) a) b) c'));
+EXECUTE IMMEDIATE dq_sql INTO dq_lv_stats;
+
+-- Selección: manual si existe; si no, automática.
+SET VAR dq_lv_col_carga = coalesce(
+  IF(exists(dq_lv_cands, x -> x.columna = dq_lv_col_carga), dq_lv_col_carga, NULL),
+  (SELECT max_by(c.columna, named_struct('ts', c.familia = 'TIMESTAMP', 'dias', s.n_dias, 'n', s.n_fecha_valida))
+   FROM (SELECT inline(dq_lv_cands)) c JOIN (SELECT inline(dq_lv_stats)) s ON s.columna = c.columna
+   WHERE c.rol = 'CARGA' AND s.n_no_nulos > 0 AND s.n_fecha_valida >= 0.9 * s.n_no_nulos),
+  '');
+SET VAR dq_lv_col_negocio = coalesce(
+  IF(exists(dq_lv_cands, x -> x.columna = dq_lv_col_negocio), dq_lv_col_negocio, NULL),
+  (SELECT max_by(c.columna, named_struct('dic', c.en_diccionario, 'dias', s.n_dias, 'n', s.n_fecha_valida))
+   FROM (SELECT inline(dq_lv_cands)) c JOIN (SELECT inline(dq_lv_stats)) s ON s.columna = c.columna
+   WHERE c.rol = 'NEGOCIO' AND c.columna <> dq_lv_col_carga
+     AND s.n_no_nulos > 0 AND s.n_fecha_valida >= 0.9 * s.n_no_nulos AND s.n_dias >= 2),
+  '');
+SET VAR dq_lv_col_lote = coalesce(
+  IF(exists(dq_lv_cands, x -> x.columna = dq_lv_col_lote), dq_lv_col_lote, NULL),
+  (SELECT max_by(c.columna, named_struct('n', s.n_no_nulos, 'd', s.n_distintos))
+   FROM (SELECT inline(dq_lv_cands)) c JOIN (SELECT inline(dq_lv_stats)) s ON s.columna = c.columna
+   WHERE c.rol = 'LOTE' AND c.columna NOT IN (dq_lv_col_carga, dq_lv_col_negocio)
+     AND s.n_no_nulos > 0 AND s.n_distintos <= 100000),
+  '');
+SET VAR dq_lv_rol_serie = CASE WHEN dq_lv_col_carga <> '' THEN 'CARGA' WHEN dq_lv_col_negocio <> '' THEN 'NEGOCIO'
+                               WHEN dq_lv_col_lote <> '' THEN 'LOTE' ELSE '' END;
+
+SET VAR dq_sql = concat(
+  'CREATE OR REPLACE TEMP VIEW dq_lv_base AS SELECT *, ',
+  CASE dq_lv_rol_serie WHEN 'CARGA' THEN '_dq_lv_f_carga' WHEN 'NEGOCIO' THEN '_dq_lv_f_negocio'
+                       WHEN 'LOTE' THEN '_dq_lv_f_lote' ELSE 'CAST(NULL AS DATE)' END, ' AS _dq_lv_f_serie ',
+  'FROM (SELECT *, ',
+  coalesce((SELECT max(expr) FROM (SELECT inline(dq_lv_cands)) WHERE columna = dq_lv_col_carga), 'CAST(NULL AS DATE)'), ' AS _dq_lv_f_carga, ',
+  coalesce((SELECT max(expr_ts) FROM (SELECT inline(dq_lv_cands)) WHERE columna = dq_lv_col_carga), 'CAST(NULL AS TIMESTAMP)'), ' AS _dq_lv_ts_carga, ',
+  coalesce((SELECT max(expr) FROM (SELECT inline(dq_lv_cands)) WHERE columna = dq_lv_col_negocio), 'CAST(NULL AS DATE)'), ' AS _dq_lv_f_negocio, ',
+  coalesce((SELECT max(concat('CAST(', q, ' AS STRING)')) FROM (SELECT inline(dq_lv_cands)) WHERE columna = dq_lv_col_lote), 'CAST(NULL AS STRING)'), ' AS _dq_lv_lote, ',
+  coalesce((SELECT max(expr) FROM (SELECT inline(dq_lv_cands)) WHERE columna = dq_lv_col_lote), 'CAST(NULL AS DATE)'), ' AS _dq_lv_f_lote, ',
+  IF(dq_lv_col_lote = '', 'CAST(NULL AS BIGINT)',
+     coalesce((SELECT concat('xxhash64(to_json(named_struct(',
+                             array_join(transform(array_sort(collect_list(struct(ordinal, e))), x -> x.e), ', '), ')))')
+               FROM (SELECT ordinal, concat(dq_lit(columna), ', ', dq_id(columna)) AS e FROM dq_columnas
+                     WHERE columna IS NOT NULL AND columna NOT IN (dq_lv_col_carga, dq_lv_col_lote))
+               HAVING count(*) > 0), 'CAST(NULL AS BIGINT)')), ' AS _dq_lv_hash ',
+  'FROM dq_objetivo', IF(dq_lv_activo, '', ' WHERE false'), ') z');
+EXECUTE IMMEDIATE dq_sql;
+
+CREATE OR REPLACE TEMP VIEW dq_lv_eventos AS
+SELECT rol, fecha
+FROM (SELECT stack(3, 'CARGA', _dq_lv_f_carga, 'NEGOCIO', _dq_lv_f_negocio, 'LOTE', _dq_lv_f_lote) AS (rol, fecha)
+      FROM dq_lv_base) e
+WHERE fecha BETWEEN DATE'1950-01-01' AND date_add(current_date(), 366);
+
+CREATE OR REPLACE TEMP VIEW dq_lv_diario AS
+SELECT rol, fecha, count(*) AS n FROM dq_lv_eventos GROUP BY rol, fecha;
+
+-- Serie diaria completa (días sin filas = 0) con línea base robusta: mediana
+-- del MISMO día de semana en las 8 semanas previas (editen "8 PRECEDING").
+CREATE OR REPLACE TEMP VIEW dq_lv_serie AS
+WITH r AS (
+  SELECT rol, min(fecha) AS mn, max(fecha) AS mx FROM dq_lv_diario GROUP BY rol
+), cal AS (
+  SELECT rol, mx, explode(sequence(greatest(mn, date_add(mx, -3660)), mx, INTERVAL 1 DAY)) AS fecha FROM r
+), s AS (
+  SELECT c.rol, c.fecha, c.mx, coalesce(d.n, 0) AS n
+  FROM cal c LEFT JOIN dq_lv_diario d ON d.rol = c.rol AND d.fecha = c.fecha
+)
+SELECT rol, fecha, n, dayofweek(fecha) AS dow,
+       CASE dayofweek(fecha) WHEN 1 THEN 'dom' WHEN 2 THEN 'lun' WHEN 3 THEN 'mar' WHEN 4 THEN 'mié'
+                             WHEN 5 THEN 'jue' WHEN 6 THEN 'vie' ELSE 'sáb' END AS dia_semana,
+       datediff(mx, fecha) AS dias_al_final,
+       date_format(fecha, 'MM-dd') IN ('01-01', '05-01', '06-07', '06-29', '07-23', '07-28', '07-29',
+                                       '08-06', '08-30', '10-08', '11-01', '12-08', '12-09', '12-25') AS feriado_fijo,
+       date_format(date_add(fecha, -1), 'MM-dd') IN ('01-01', '05-01', '06-07', '06-29', '07-23', '07-28', '07-29',
+                                       '08-06', '08-30', '10-08', '11-01', '12-08', '12-09', '12-25') AS feriado_fijo_previo,
+       percentile_approx(n, 0.5) OVER w8 AS base_mediana,
+       count(n) OVER w8 AS n_base,
+       lag(n) OVER (PARTITION BY rol ORDER BY fecha) AS n_anterior
+FROM s
+WINDOW w8 AS (PARTITION BY rol, dayofweek(fecha) ORDER BY fecha ROWS BETWEEN 8 PRECEDING AND 1 PRECEDING);
+
+SET VAR dq_log = array_append(dq_log, named_struct(
+  'paso', 'LV.00',
+  'escenario', CASE WHEN NOT dq_lv_activo THEN 'VOLUMEN_DESACTIVADO'
+                    WHEN dq_lv_rol_serie = '' THEN 'VOLUMEN_SIN_COLUMNA_DE_TIEMPO'
+                    WHEN dq_lv_col_carga = '' AND dq_lv_col_lote = '' THEN 'VOLUMEN_SOLO_FECHA_NEGOCIO'
+                    ELSE 'VOLUMEN_CON_TRAZABILIDAD_DE_CARGA' END,
+  'detalle', concat('carga=', IF(dq_lv_col_carga = '', '(ninguna)', dq_lv_col_carga),
+                    '; negocio=', IF(dq_lv_col_negocio = '', '(ninguna)', dq_lv_col_negocio),
+                    '; lote=', IF(dq_lv_col_lote = '', '(ninguna)', dq_lv_col_lote),
+                    '; serie principal=', IF(dq_lv_rol_serie = '', '(ninguna)', dq_lv_rol_serie),
+                    IF(dq_lv_manual_invalidas = '', '', concat('; columnas indicadas que NO existen: ', dq_lv_manual_invalidas))),
+  'interpretacion', CASE
+    WHEN NOT dq_lv_activo THEN 'Capa V desactivada (dq_lv_activo = false): no hay análisis de volumen ni de cargas.'
+    WHEN dq_lv_rol_serie = '' THEN 'No se halló columna de fecha ni de archivo: no se puede analizar volumen por periodo. Fijen dq_lv_col_carga / dq_lv_col_negocio si existen con otro nombre.'
+    WHEN dq_lv_col_carga = '' AND dq_lv_col_lote = '' THEN 'Sólo hay fecha de negocio: un día bajo puede ser carga fallida O baja actividad real; sin fecha de carga ni archivo no se pueden separar.'
+    ELSE 'Hay trazabilidad de carga: los huecos y caídas por fecha de carga apuntan a problemas de ingesta; compárenlos con la fecha de negocio (LV.05-LV.06).' END));
+
+SELECT c.columna, c.familia, c.rol, c.en_diccionario, s.n_no_nulos, s.n_fecha_valida,
+       round(s.n_fecha_valida / NULLIF(s.n_no_nulos, 0), 4) AS pct_fecha_valida,
+       s.n_fecha - s.n_fecha_valida AS n_fuera_de_rango, s.f_min, s.f_max, s.n_dias, s.n_distintos,
+       CASE WHEN c.columna = dq_lv_col_carga THEN 'ELEGIDA_CARGA' WHEN c.columna = dq_lv_col_negocio THEN 'ELEGIDA_NEGOCIO'
+            WHEN c.columna = dq_lv_col_lote THEN 'ELEGIDA_LOTE' ELSE '' END AS seleccion
+FROM (SELECT inline(dq_lv_cands)) c
+LEFT JOIN (SELECT inline(dq_lv_stats)) s ON s.columna = c.columna
+ORDER BY CASE WHEN c.columna IN (dq_lv_col_carga, dq_lv_col_negocio, dq_lv_col_lote) THEN 0 ELSE 1 END, c.rol, c.columna;
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+   [LV.01] Resumen por reloj: cobertura del calendario, cadencia y frescura
+   DOCSTRING (es-PE)
+     Una fila por rol (CARGA, NEGOCIO, LOTE): columna usada, filas con fecha
+     válida, rango, días calendario vs. días con datos, cadencia típica
+     (mediana de días entre fechas con datos), brecha máxima, días desde la
+     última fecha hasta hoy y concentración de filas en los últimos 30 días
+     del rango.
+   TOOLTIP ▸ Cómo leer e interpretar (hipótesis alternativas)
+     • CARGA_UNICA (un solo día de carga): la tabla es una foto (snapshot o
+       full refresh); el volumen por fecha de carga no informa nada; usen el
+       reloj NEGOCIO.
+     • CONCENTRADO_RECIENTE: muchas más filas en los últimos 30 días de lo
+       esperable. Hipótesis: 1) la "fecha de actualización" se sobrescribe
+       en cada actualización (SCD1), así las filas viejas "se mudan" a fechas
+       recientes y el pasado se ve vacío → no interpreten huecos antiguos
+       como cargas fallidas; 2) crecimiento real; 3) recarga masiva reciente.
+       Lo distinguen con LV.05 (latencia negocio→carga muy larga en filas
+       recientes = sobrescritura o recarga).
+     • DESACTUALIZADO (días_desde_ultima > 2 × cadencia): la carga dejó de
+       llegar, o la tabla que leen es una copia/histórico. Confirmen con el
+       dueño del proceso antes de reportarlo como incidente.
+     • NO_DISPONIBLE: no hay columna para ese rol (ver LV.00).
+   ──────────────────────────────────────────────────────────────────────────── */
+WITH roles AS (
+  SELECT * FROM VALUES ('CARGA', 1), ('NEGOCIO', 2), ('LOTE', 3) AS t(rol, o)
+), fechas AS (
+  SELECT rol, count(fecha) AS n_con_fecha
+  FROM (SELECT stack(3, 'CARGA', _dq_lv_f_carga, 'NEGOCIO', _dq_lv_f_negocio, 'LOTE', _dq_lv_f_lote) AS (rol, fecha)
+        FROM dq_lv_base) e
+  GROUP BY rol
+), activos AS (
+  SELECT rol, fecha, n, datediff(fecha, lag(fecha) OVER (PARTITION BY rol ORDER BY fecha)) AS salto
+  FROM dq_lv_diario
+), agg AS (
+  SELECT rol, sum(n) AS n_validas, min(fecha) AS fecha_min, max(fecha) AS fecha_max, count(*) AS dias_con_datos,
+         percentile_approx(salto, 0.5) AS cadencia_dias, max(salto) AS max_brecha_dias
+  FROM activos GROUP BY rol
+), rec AS (
+  SELECT a.rol, sum(IF(d.fecha > date_add(a.fecha_max, -30), d.n, 0)) / NULLIF(sum(d.n), 0) AS pct_ult_30d
+  FROM agg a JOIN dq_lv_diario d ON d.rol = a.rol GROUP BY a.rol
+), t AS (
+  SELECT r.rol, r.o,
+         CASE r.rol WHEN 'CARGA' THEN dq_lv_col_carga WHEN 'NEGOCIO' THEN dq_lv_col_negocio ELSE dq_lv_col_lote END AS columna,
+         f.n_con_fecha, a.n_validas, a.fecha_min, a.fecha_max, a.dias_con_datos,
+         datediff(a.fecha_max, a.fecha_min) + 1 AS dias_calendario,
+         a.cadencia_dias, a.max_brecha_dias, datediff(current_date(), a.fecha_max) AS dias_desde_ultima,
+         rec.pct_ult_30d
+  FROM roles r LEFT JOIN fechas f ON f.rol = r.rol LEFT JOIN agg a ON a.rol = r.rol LEFT JOIN rec ON rec.rol = r.rol
+)
+SELECT rol, nullif(columna, '') AS columna, dq_n_filas_total AS n_filas_tabla, n_validas AS n_con_fecha_valida,
+       round(n_validas / NULLIF(dq_n_filas_total, 0), 4) AS pct_con_fecha_valida,
+       coalesce(n_con_fecha, 0) - coalesce(n_validas, 0) AS n_fuera_de_rango,
+       fecha_min, fecha_max, dias_calendario, dias_con_datos,
+       round(dias_con_datos / NULLIF(dias_calendario, 0), 4) AS pct_dias_con_datos,
+       cadencia_dias, max_brecha_dias, dias_desde_ultima, round(pct_ult_30d, 4) AS pct_filas_ultimos_30d,
+       filter(array(
+         IF(columna = '' OR n_validas IS NULL, 'NO_DISPONIBLE', NULL),
+         IF(dias_con_datos = 1, 'CARGA_UNICA', NULL),
+         IF(dias_calendario > 90 AND pct_ult_30d > least(0.9, 3 * 30 / dias_calendario), 'CONCENTRADO_RECIENTE', NULL),
+         IF(dias_desde_ultima > greatest(2 * coalesce(cadencia_dias, 1), 2), 'DESACTUALIZADO', NULL),
+         IF(max_brecha_dias > greatest(3 * coalesce(cadencia_dias, 1), 3), 'BRECHAS_LARGAS', NULL),
+         IF(coalesce(n_con_fecha, 0) - coalesce(n_validas, 0) > 0, 'FECHAS_FUERA_DE_RANGO', NULL)), x -> x IS NOT NULL) AS diagnostico,
+       CASE
+         WHEN columna = '' OR n_validas IS NULL THEN 'Sin columna para este reloj (ver LV.00).'
+         WHEN dias_con_datos = 1 THEN '1) foto completa (snapshot/full refresh) 2) una sola carga histórica: el volumen por este reloj no sirve; usen otro reloj.'
+         WHEN dias_calendario > 90 AND pct_ult_30d > least(0.9, 3 * 30 / dias_calendario)
+           THEN '1) fecha que se sobrescribe al actualizar (SCD1) 2) recarga masiva reciente 3) crecimiento real. Ver LV.05.'
+         WHEN dias_desde_ultima > greatest(2 * coalesce(cadencia_dias, 1), 2)
+           THEN '1) la carga dejó de llegar 2) la tabla es una copia o histórico 3) la columna elegida no es la de carga.'
+         ELSE 'Cobertura y cadencia sin alertas generales; revisen el detalle en LV.02-LV.04.' END AS hipotesis
+FROM t
+ORDER BY o;
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+   [LV.02] Días anómalos: huecos, caídas y picos vs. el mismo día de semana
+   DOCSTRING (es-PE)
+     Sobre la serie diaria completa de cada reloj compara el conteo del día
+     con la mediana del mismo día de semana en las 8 semanas previas
+     (base_mediana). Estados: HUECO (0 filas donde normalmente hay),
+     BAJO (razón < dq_lv_umbral_bajo), ALTO (razón > dq_lv_umbral_alto),
+     ACTIVIDAD_INUSUAL (filas en un día que normalmente no tiene),
+     RECIENTE_POSIBLE_INCOMPLETO (caída en los últimos dq_lv_dias_recientes
+     días: puede ser latencia, no falla). Etiquetas: FERIADO (fijos de Perú +
+     dq_lv_feriados), DIA_POST_FERIADO, FIN_DE_SEMANA, FIN_DE_MES,
+     PREVIO_HUECO (pico justo después de un hueco), SIGUIENTE_ALTO (hueco o
+     caída seguido de un pico). Sólo lista días no normales.
+   TOOLTIP ▸ Cómo leer e interpretar (hipótesis alternativas)
+     • HUECO/BAJO + SIGUIENTE_ALTO (y ALTO + PREVIO_HUECO al día siguiente):
+       carga diferida, el archivo se cargó un día después. No se perdió data;
+       el problema es de oportunidad (SLA). Confírmenlo en LV.07 (archivo
+       cargado en otra fecha) y LV.06.
+     • HUECO/BAJO sin recuperación: 1) carga fallida o parcial (archivo
+       truncado: crucen con LD.08 y LV.07); 2) el origen no envió; 3) baja
+       actividad real; 4) filtro de filas. En reloj CARGA pesa más 1); en
+       reloj NEGOCIO pesa más 3).
+     • Con etiqueta FERIADO o DIA_POST_FERIADO: primero sospechen
+       estacionalidad real (comparen con el mismo feriado de otro año).
+       Semana Santa y feriados puntuales NO están en la lista fija:
+       agréguenlos en dq_lv_feriados.
+     • ALTO sin PREVIO_HUECO: 1) carga duplicada o reenvío (LV.07
+       DUPLICADO_EXACTO, L1.05); 2) backfill o recarga histórica (LV.06);
+       3) evento real (fin de mes, quincena, campaña).
+     • Días con TIMESTAMP de carga cerca de medianoche pueden "cambiar de
+       día" según la zona horaria de la sesión (UTC vs. America/Lima).
+   ──────────────────────────────────────────────────────────────────────────── */
+WITH s AS (
+  SELECT *, n / NULLIF(base_mediana, 0) AS razon,
+         feriado_fijo OR array_contains(split(regexp_replace(dq_lv_feriados, ' ', ''), ','), CAST(fecha AS STRING)) AS feriado,
+         feriado_fijo_previo OR array_contains(split(regexp_replace(dq_lv_feriados, ' ', ''), ','), CAST(date_add(fecha, -1) AS STRING)) AS post_feriado
+  FROM dq_lv_serie
+), e AS (
+  SELECT *,
+         CASE WHEN base_mediana > 0 AND dias_al_final < dq_lv_dias_recientes AND (n = 0 OR razon < dq_lv_umbral_bajo)
+                THEN 'RECIENTE_POSIBLE_INCOMPLETO'
+              WHEN n_base < 3 THEN 'SIN_BASE'
+              WHEN n = 0 AND base_mediana > 0 THEN 'HUECO'
+              WHEN n = 0 THEN 'SIN_ACTIVIDAD_HABITUAL'
+              WHEN coalesce(base_mediana, 0) = 0 THEN 'ACTIVIDAD_INUSUAL'
+              WHEN razon < dq_lv_umbral_bajo THEN 'BAJO'
+              WHEN razon > dq_lv_umbral_alto THEN 'ALTO'
+              ELSE 'NORMAL' END AS estado
+  FROM s
+), f AS (
+  SELECT *, lead(razon) OVER (PARTITION BY rol ORDER BY fecha) AS razon_siguiente FROM e
+)
+SELECT rol,
+       CASE rol WHEN 'CARGA' THEN dq_lv_col_carga WHEN 'NEGOCIO' THEN dq_lv_col_negocio ELSE dq_lv_col_lote END AS columna,
+       fecha, dia_semana, n, base_mediana, round(razon, 3) AS razon, estado,
+       filter(array(
+         IF(feriado, 'FERIADO', NULL), IF(post_feriado, 'DIA_POST_FERIADO', NULL),
+         IF(dow IN (1, 7), 'FIN_DE_SEMANA', NULL), IF(fecha = last_day(fecha), 'FIN_DE_MES', NULL),
+         IF(estado = 'ALTO' AND n_anterior = 0, 'PREVIO_HUECO', NULL),
+         IF(estado IN ('HUECO', 'BAJO') AND razon_siguiente > dq_lv_umbral_alto, 'SIGUIENTE_ALTO', NULL)), x -> x IS NOT NULL) AS etiquetas,
+       CASE
+         WHEN estado = 'RECIENTE_POSIBLE_INCOMPLETO' THEN '1) data aún en camino (latencia, ver LV.05) 2) carga del día fallida. Revaluar en unos días.'
+         WHEN estado IN ('HUECO', 'BAJO') AND razon_siguiente > dq_lv_umbral_alto
+           THEN '1) carga diferida: se cargó al día siguiente (ver ALTO siguiente y LV.07) 2) proceso fallido y reprocesado.'
+         WHEN estado IN ('HUECO', 'BAJO') AND (feriado OR post_feriado)
+           THEN '1) efecto feriado (actividad real menor) 2) carga parcial o no ejecutada.'
+         WHEN estado = 'HUECO' AND rol = 'NEGOCIO'
+           THEN '1) sin actividad ese día 2) carga de ese día perdida (ver reloj CARGA) 3) filtro de filas.'
+         WHEN estado = 'HUECO'
+           THEN '1) carga no ejecutada o fallida 2) el origen no envió archivo 3) datos borrados o filtrados 4) si la fecha se sobrescribe (SCD1), filas re-actualizadas después.'
+         WHEN estado = 'BAJO'
+           THEN '1) carga parcial (archivo truncado: ver LD.08 y LV.07) 2) caída de la fuente o baja actividad real 3) datos tardíos aún no cargados (LV.05).'
+         WHEN estado = 'ALTO' AND n_anterior = 0
+           THEN '1) recuperación del hueco del día anterior (no es duplicado) 2) carga duplicada.'
+         WHEN estado = 'ALTO'
+           THEN '1) carga duplicada o reenvío (LV.07, L1.05) 2) backfill / recarga histórica (LV.06) 3) evento real (fin de mes, campaña).'
+         WHEN estado = 'ACTIVIDAD_INUSUAL'
+           THEN '1) carga extraordinaria o reproceso en día sin actividad habitual 2) cambio de calendario operativo.'
+       END AS hipotesis
+FROM f
+WHERE estado NOT IN ('NORMAL', 'SIN_BASE', 'SIN_ACTIVIDAD_HABITUAL')
+ORDER BY rol, fecha
+LIMIT 1000;
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+   [LV.03] Huecos como rachas: días seguidos sin filas
+   DOCSTRING (es-PE)
+     Agrupa días consecutivos con 0 filas en rachas (desde, hasta, días,
+     días hábiles = sin fin de semana ni feriado) y mira el día siguiente
+     a la racha. Clasifica: HUECO_CON_RECUPERACION (el día siguiente trae un
+     pico), HUECO_RECIENTE (toca el final de la serie), SOLO_FIN_DE_SEMANA_O_
+     FERIADO, HUECO_HABIL. Ignora rachas en días que nunca tienen actividad
+     (base 0).
+   TOOLTIP ▸ Cómo leer e interpretar (hipótesis alternativas)
+     • HUECO_HABIL largo en reloj CARGA = periodo sin cargas: incidente de
+       ingesta o datos aún no recuperados. Si el reloj NEGOCIO NO tiene el
+       mismo hueco, la data llegó por otra carga (backfill) → oportunidad,
+       no pérdida.
+     • HUECO_CON_RECUPERACION: la data se recuperó al día siguiente
+       (compárenlo con el pico de LV.02).
+     • SOLO_FIN_DE_SEMANA_O_FERIADO: probablemente esperado; confírmenlo con
+       el calendario operativo del origen.
+     • Si el hueco coincide con el cambio de layout (change log del
+       diccionario) sospechen registros rechazados por el parser de ingesta.
+   ──────────────────────────────────────────────────────────────────────────── */
+WITH s AS (
+  SELECT *, (dow IN (1, 7) OR feriado_fijo
+             OR array_contains(split(regexp_replace(dq_lv_feriados, ' ', ''), ','), CAST(fecha AS STRING))) AS no_habil
+  FROM dq_lv_serie
+), z AS (
+  SELECT *, date_add(fecha, -CAST(row_number() OVER (PARTITION BY rol ORDER BY fecha) AS INT)) AS grupo
+  FROM s WHERE n = 0
+), rachas AS (
+  SELECT rol, grupo, min(fecha) AS desde, max(fecha) AS hasta, count(*) AS dias,
+         count_if(NOT no_habil) AS dias_habiles, max(coalesce(base_mediana, 0)) AS base_max, min(dias_al_final) AS dias_al_final
+  FROM z GROUP BY rol, grupo
+)
+SELECT r.rol,
+       CASE r.rol WHEN 'CARGA' THEN dq_lv_col_carga WHEN 'NEGOCIO' THEN dq_lv_col_negocio ELSE dq_lv_col_lote END AS columna,
+       r.desde, r.hasta, r.dias, r.dias_habiles, a.n AS n_dia_anterior, d.n AS n_dia_siguiente, d.base_mediana AS base_dia_siguiente,
+       CASE WHEN d.n / NULLIF(d.base_mediana, 0) > dq_lv_umbral_alto THEN 'HUECO_CON_RECUPERACION'
+            WHEN r.dias_al_final < dq_lv_dias_recientes OR d.fecha IS NULL THEN 'HUECO_RECIENTE'
+            WHEN r.dias_habiles = 0 THEN 'SOLO_FIN_DE_SEMANA_O_FERIADO'
+            ELSE 'HUECO_HABIL' END AS clasificacion,
+       CASE WHEN d.n / NULLIF(d.base_mediana, 0) > dq_lv_umbral_alto
+              THEN '1) carga diferida y recuperada al día siguiente 2) reproceso tras falla. Riesgo: SLA, no pérdida.'
+            WHEN r.dias_al_final < dq_lv_dias_recientes OR d.fecha IS NULL
+              THEN '1) data aún en camino 2) carga detenida. Revaluar después.'
+            WHEN r.dias_habiles = 0 THEN '1) sin operación en fin de semana/feriado (esperado) 2) carga no ejecutada.'
+            ELSE '1) cargas fallidas o no ejecutadas 2) el origen no envió 3) filas borradas/filtradas. Comparen con el otro reloj.' END AS hipotesis
+FROM rachas r
+LEFT JOIN dq_lv_serie a ON a.rol = r.rol AND a.fecha = date_add(r.desde, -1)
+LEFT JOIN dq_lv_serie d ON d.rol = r.rol AND d.fecha = date_add(r.hasta, 1)
+WHERE r.base_max > 0
+ORDER BY r.rol, r.desde
+LIMIT 1000;
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+   [LV.04] Volumen mensual por reloj con comparación robusta
+   DOCSTRING (es-PE)
+     Por rol y mes: filas, días con datos, días del mes dentro del rango
+     observado, promedio por día activo, filas normalizadas al mes completo
+     (meses de borde), base = mediana de los 6 meses previos, razón,
+     variación vs. mes anterior y vs. el mismo mes del año anterior.
+     Estados: MES_SIN_DATOS, MES_PARCIAL_BORDE, MES_BAJO (< (1+umbral_bajo)/2
+     de la base, p.ej. 0,75), MES_ALTO (> (1+umbral_alto)/2, p.ej. 1,4),
+     DIAS_FALTANTES (menos días con datos que lo habitual) o NORMAL.
+     Muestra todos los meses.
+   TOOLTIP ▸ Cómo leer e interpretar (hipótesis alternativas)
+     • MES_BAJO con DIAS_FALTANTES: faltan cargas puntuales → vean qué días
+       en LV.02/LV.03.
+     • MES_BAJO sin días faltantes: todas las cargas vinieron "flacas" →
+       1) cambio de filtro o de alcance en el origen, 2) estacionalidad real
+       (comparen var_anual), 3) cambio de layout que descarta registros.
+     • MES_ALTO: 1) duplicados (L1.05, LV.07), 2) recarga histórica que cae
+       en este mes por fecha de carga, 3) crecimiento o campaña.
+     • MES_PARCIAL_BORDE: primer o último mes cortado; no lo comparen tal
+       cual (usen n_normalizado).
+   ──────────────────────────────────────────────────────────────────────────── */
+WITH r AS (
+  SELECT rol, min(fecha) AS mn, max(fecha) AS mx FROM dq_lv_diario GROUP BY rol
+), meses AS (
+  SELECT rol, mn, mx, explode(sequence(trunc(mn, 'MM'), trunc(mx, 'MM'), INTERVAL 1 MONTH)) AS mes FROM r
+), m AS (
+  SELECT x.rol, x.mes, x.mn, x.mx, coalesce(sum(d.n), 0) AS n, count(d.fecha) AS dias_con_datos,
+         day(last_day(x.mes)) AS dias_mes,
+         datediff(least(last_day(x.mes), x.mx), greatest(x.mes, x.mn)) + 1 AS dias_en_rango
+  FROM meses x LEFT JOIN dq_lv_diario d ON d.rol = x.rol AND trunc(d.fecha, 'MM') = x.mes
+  GROUP BY x.rol, x.mes, x.mn, x.mx
+), b AS (
+  SELECT *, n * dias_mes / NULLIF(dias_en_rango, 0) AS n_normalizado,
+         percentile_approx(n * dias_mes / NULLIF(dias_en_rango, 0), 0.5)
+           OVER (PARTITION BY rol ORDER BY mes ROWS BETWEEN 6 PRECEDING AND 1 PRECEDING) AS base_6m,
+         percentile_approx(dias_con_datos * dias_mes / NULLIF(dias_en_rango, 0), 0.5)
+           OVER (PARTITION BY rol ORDER BY mes ROWS BETWEEN 6 PRECEDING AND 1 PRECEDING) AS dias_base_6m,
+         lag(n) OVER (PARTITION BY rol ORDER BY mes) AS n_mes_anterior,
+         lag(n, 12) OVER (PARTITION BY rol ORDER BY mes) AS n_anio_anterior
+  FROM m
+)
+SELECT rol,
+       CASE rol WHEN 'CARGA' THEN dq_lv_col_carga WHEN 'NEGOCIO' THEN dq_lv_col_negocio ELSE dq_lv_col_lote END AS columna,
+       date_format(mes, 'yyyy-MM') AS mes, n, dias_con_datos, dias_en_rango,
+       round(n / NULLIF(dias_con_datos, 0), 1) AS prom_por_dia_activo,
+       round(n_normalizado, 0) AS n_normalizado, round(base_6m, 0) AS base_6m,
+       round(n_normalizado / NULLIF(base_6m, 0), 3) AS razon,
+       round(n / NULLIF(n_mes_anterior, 0) - 1, 3) AS var_mes_anterior,
+       round(n / NULLIF(n_anio_anterior, 0) - 1, 3) AS var_anual,
+       CASE WHEN n = 0 THEN 'MES_SIN_DATOS'
+            WHEN dias_en_rango < dias_mes THEN 'MES_PARCIAL_BORDE'
+            WHEN n_normalizado / NULLIF(base_6m, 0) < (1 + dq_lv_umbral_bajo) / 2 THEN 'MES_BAJO'
+            WHEN n_normalizado / NULLIF(base_6m, 0) > (1 + dq_lv_umbral_alto) / 2 THEN 'MES_ALTO'
+            WHEN dias_con_datos < dias_base_6m - 2 THEN 'DIAS_FALTANTES'
+            ELSE 'NORMAL' END AS estado,
+       CASE WHEN n = 0 THEN '1) mes sin cargas (incidente o fuera de alcance) 2) filtro de filas 3) la fecha se sobrescribe (SCD1, ver LV.01).'
+            WHEN dias_en_rango < dias_mes THEN 'Mes cortado por el inicio o fin del rango: comparen n_normalizado.'
+            WHEN n_normalizado / NULLIF(base_6m, 0) < (1 + dq_lv_umbral_bajo) / 2
+              THEN IF(dias_con_datos < dias_base_6m - 2,
+                      '1) faltan cargas puntuales (ver LV.02/LV.03) 2) baja actividad real.',
+                      '1) cargas incompletas todo el mes (filtro/alcance/layout) 2) estacionalidad real (ver var_anual).')
+            WHEN n_normalizado / NULLIF(base_6m, 0) > (1 + dq_lv_umbral_alto) / 2
+              THEN '1) duplicados o reenvíos (L1.05, LV.07) 2) recarga histórica 3) crecimiento o campaña.'
+            WHEN dias_con_datos < dias_base_6m - 2 THEN '1) días sin carga compensados por otros días 2) cambio de calendario.'
+            ELSE NULL END AS hipotesis
+FROM b
+ORDER BY rol, mes;
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+   [LV.05] Latencia fecha de negocio → fecha de carga
+   DOCSTRING (es-PE)
+     Si hay reloj CARGA y NEGOCIO: días entre la fecha del hecho y su carga
+     (p50, p90, p99, máximo), % cargado el mismo día, % con carga ANTES del
+     hecho (latencia negativa) y % con más de 30 días de atraso.
+   TOOLTIP ▸ Cómo leer e interpretar (hipótesis alternativas)
+     • p50/p90 dan el SLA real: los últimos p90 días de la serie NEGOCIO
+       siempre se verán incompletos (aún llegan) → no los reporten como
+       caída.
+     • pct_negativa > 0: 1) fechas de negocio futuras (operaciones
+       programadas), 2) zona horaria (carga en UTC, negocio en hora Lima),
+       3) columnas mal elegidas o invertidas (revisen LV.00).
+     • pct_mas_30_dias alto: 1) recargas o backfills, 2) fecha de
+       actualización que se sobrescribe (SCD1), 3) correcciones tardías.
+     • OMITIDO: falta uno de los dos relojes.
+   ──────────────────────────────────────────────────────────────────────────── */
+WITH l AS (
+  SELECT datediff(_dq_lv_f_carga, _dq_lv_f_negocio) AS lag
+  FROM dq_lv_base
+  WHERE _dq_lv_f_carga BETWEEN DATE'1950-01-01' AND date_add(current_date(), 366)
+    AND _dq_lv_f_negocio BETWEEN DATE'1950-01-01' AND date_add(current_date(), 366)
+)
+SELECT IF(dq_lv_col_carga = '' OR dq_lv_col_negocio = '', 'OMITIDO', 'CALCULADO') AS estado,
+       nullif(dq_lv_col_negocio, '') AS columna_negocio, nullif(dq_lv_col_carga, '') AS columna_carga,
+       count(lag) AS n_pares,
+       percentile_approx(lag, 0.5) AS lag_p50, percentile_approx(lag, 0.9) AS lag_p90,
+       percentile_approx(lag, 0.99) AS lag_p99, max(lag) AS lag_max,
+       round(count_if(lag = 0) / NULLIF(count(lag), 0), 4) AS pct_mismo_dia,
+       round(count_if(lag < 0) / NULLIF(count(lag), 0), 4) AS pct_negativa,
+       round(count_if(lag > 30) / NULLIF(count(lag), 0), 4) AS pct_mas_30_dias,
+       CASE WHEN dq_lv_col_carga = '' OR dq_lv_col_negocio = '' THEN 'Falta reloj de carga o de negocio (ver LV.00): no se puede medir latencia.'
+            WHEN count_if(lag < 0) / NULLIF(count(lag), 0) > 0.01 THEN '1) fechas de negocio futuras 2) zona horaria 3) columnas mal elegidas o invertidas.'
+            WHEN count_if(lag > 30) / NULLIF(count(lag), 0) > 0.05 THEN '1) recargas/backfills 2) fecha de actualización sobrescrita (SCD1) 3) correcciones tardías.'
+            ELSE 'Latencia estable: usen lag_p90 como ventana de "datos aún en camino".' END AS hipotesis
+FROM l;
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+   [LV.06] Recargas y cargas repetidas (cruce carga × negocio)
+   DOCSTRING (es-PE)
+     Dos vistas en una salida (columna tipo):
+       POR_FECHA_CARGA : días de carga que traen fechas de negocio mucho más
+         antiguas que lo normal (más allá de p99 de latencia + 7 días) o
+         muchas más fechas de negocio distintas que lo habitual →
+         RECARGA_O_BACKFILL.
+       POR_FECHA_NEGOCIO : fechas de negocio cuya data llegó repartida en
+         varias cargas y la parte que NO vino en la carga principal es
+         ≥ 30% → CARGA_REPETIDA_O_TARDIA_MASIVA.
+     Sólo lista excepciones.
+   TOOLTIP ▸ Cómo leer e interpretar (hipótesis alternativas)
+     • CARGA_REPETIDA_O_TARDIA_MASIVA con n_filas ≈ 2 × lo normal en LV.02
+       (reloj NEGOCIO): DUPLICADO por reenvío del mismo archivo → validen con
+       LV.07 (DUPLICADO_EXACTO) y L1.05. Si el total por fecha de negocio es
+       normal, fue una carga tardía de la parte faltante (no duplicado).
+     • RECARGA_O_BACKFILL: reproceso de histórico. Es legítimo si fue
+       planificado; si no, puede duplicar o pisar datos ya cargados.
+   ──────────────────────────────────────────────────────────────────────────── */
+WITH b AS (
+  SELECT _dq_lv_f_carga AS fc, _dq_lv_f_negocio AS fn
+  FROM dq_lv_base
+  WHERE _dq_lv_f_carga BETWEEN DATE'1950-01-01' AND date_add(current_date(), 366)
+    AND _dq_lv_f_negocio BETWEEN DATE'1950-01-01' AND date_add(current_date(), 366)
+), p AS (
+  SELECT percentile_approx(datediff(fc, fn), 0.99) AS p99 FROM b
+), pc AS (
+  SELECT fc, count(*) AS n, count(DISTINCT fn) AS n_fn, min(fn) AS fn_min, max(fn) AS fn_max FROM b GROUP BY fc
+), pc2 AS (
+  SELECT pc.*, percentile_approx(n_fn, 0.5) OVER () AS n_fn_mediana FROM pc
+), pn AS (
+  SELECT fn, fc, count(*) AS n FROM b GROUP BY fn, fc
+), pn2 AS (
+  SELECT fn, sum(n) AS n, count(*) AS n_cargas, max(n) AS n_principal, max_by(fc, n) AS carga_principal,
+         array_join(slice(array_sort(collect_list(CAST(fc AS STRING))), 1, 5), ', ') AS cargas
+  FROM pn GROUP BY fn
+)
+SELECT 'POR_FECHA_CARGA' AS tipo, pc2.fc AS fecha, pc2.n AS n_filas,
+       concat('fechas de negocio: ', pc2.n_fn, ' distintas (mediana ', pc2.n_fn_mediana, '), de ', pc2.fn_min, ' a ', pc2.fn_max) AS detalle,
+       'RECARGA_O_BACKFILL' AS diagnostico,
+       '1) reproceso o backfill planificado 2) recarga no planificada que puede duplicar data 3) archivo acumulado tras días sin carga.' AS hipotesis
+FROM pc2 CROSS JOIN p
+WHERE dq_lv_col_carga <> '' AND dq_lv_col_negocio <> ''
+  AND (pc2.fn_min < date_add(pc2.fc, -CAST(coalesce(p.p99, 0) + 7 AS INT))
+       OR (pc2.n_fn > 3 * pc2.n_fn_mediana AND pc2.n_fn > 3))
+UNION ALL
+SELECT 'POR_FECHA_NEGOCIO', pn2.fn, pn2.n,
+       concat('llegó en ', pn2.n_cargas, ' cargas (', pn2.cargas, '); principal ', pn2.carga_principal,
+              ' con ', pn2.n_principal, ' filas; resto ', pn2.n - pn2.n_principal),
+       'CARGA_REPETIDA_O_TARDIA_MASIVA',
+       '1) reenvío/duplicado del archivo (ver LV.07 y L1.05) 2) carga tardía de la parte faltante (total normal) 3) corrección masiva.'
+FROM pn2
+WHERE dq_lv_col_carga <> '' AND dq_lv_col_negocio <> ''
+  AND pn2.n >= 20 AND (pn2.n - pn2.n_principal) >= 0.3 * pn2.n
+ORDER BY tipo, fecha
+LIMIT 1000;
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+   [LV.07] Archivos o lotes: tamaño, duplicados y fecha de carga
+   DOCSTRING (es-PE)
+     Por valor de la columna LOTE (archivo): filas, fecha en el nombre,
+     fechas de carga y de negocio que contiene, y una huella del contenido
+     (suma de hash de cada fila sin las columnas de carga y lote). Marca:
+       DUPLICADO_EXACTO : otro lote con el mismo número de filas y la misma
+         huella (mismo contenido con otro nombre).
+       TAMANO_BAJO / TAMANO_ALTO : filas vs. la mediana de lotes del mismo
+         día de semana (razón < umbral_bajo o > umbral_alto).
+       VARIAS_FECHAS_CARGA : el mismo lote cargado en más de un día.
+       CARGADO_EN_OTRA_FECHA : la fecha del nombre ≠ primera fecha de carga.
+     Sólo lista lotes con alguna marca.
+   TOOLTIP ▸ Cómo leer e interpretar (hipótesis alternativas)
+     • DUPLICADO_EXACTO: reenvío con otro nombre; si ambos están cargados la
+       data está duplicada → confirmen con L1.05 y LV.06.
+     • TAMANO_BAJO: 1) archivo truncado (crucen con el trailer en LD.08),
+       2) carga parcial, 3) día de baja actividad (feriado).
+     • VARIAS_FECHAS_CARGA: el mismo archivo se procesó dos veces → riesgo
+       de duplicados.
+     • CARGADO_EN_OTRA_FECHA: llegada tardía (SLA) o convención de nombre
+       distinta (fecha del archivo = fecha de negocio, no de carga). Si TODOS
+       los lotes tienen la misma diferencia, es la convención, no un
+       problema.
+     • OMITIDO: no hay columna de archivo/lote (ver LV.00).
+   ──────────────────────────────────────────────────────────────────────────── */
+WITH l AS (
+  SELECT _dq_lv_lote AS lote, count(*) AS n, min(_dq_lv_f_lote) AS fecha_nombre,
+         min(_dq_lv_f_carga) AS carga_min, max(_dq_lv_f_carga) AS carga_max,
+         count(DISTINCT _dq_lv_f_carga) AS n_fechas_carga,
+         min(_dq_lv_f_negocio) AS negocio_min, max(_dq_lv_f_negocio) AS negocio_max,
+         sum(CAST(_dq_lv_hash AS DECIMAL(38, 0))) AS huella
+  FROM dq_lv_base WHERE _dq_lv_lote IS NOT NULL GROUP BY _dq_lv_lote
+), m AS (
+  SELECT *, count(*) OVER (PARTITION BY n, huella) AS n_misma_huella,
+         percentile_approx(n, 0.5) OVER (PARTITION BY dayofweek(coalesce(fecha_nombre, carga_min, negocio_max))) AS mediana_dia,
+         count(*) OVER (PARTITION BY dayofweek(coalesce(fecha_nombre, carga_min, negocio_max))) AS n_lotes_dia
+  FROM l
+), f AS (
+  SELECT *, filter(array(
+           IF(n_misma_huella > 1 AND huella IS NOT NULL, 'DUPLICADO_EXACTO', NULL),
+           IF(n_lotes_dia >= 4 AND n / NULLIF(mediana_dia, 0) < dq_lv_umbral_bajo, 'TAMANO_BAJO', NULL),
+           IF(n_lotes_dia >= 4 AND n / NULLIF(mediana_dia, 0) > dq_lv_umbral_alto, 'TAMANO_ALTO', NULL),
+           IF(n_fechas_carga > 1, 'VARIAS_FECHAS_CARGA', NULL),
+           IF(fecha_nombre IS NOT NULL AND carga_min IS NOT NULL AND carga_min <> fecha_nombre,
+              concat('CARGADO_EN_OTRA_FECHA(', datediff(carga_min, fecha_nombre), 'd)'), NULL)), x -> x IS NOT NULL) AS marcas
+  FROM m
+)
+SELECT lote, n, mediana_dia AS mediana_mismo_dia_semana, round(n / NULLIF(mediana_dia, 0), 3) AS razon,
+       fecha_nombre, carga_min, carga_max, negocio_min, negocio_max, marcas,
+       CASE WHEN array_contains(marcas, 'DUPLICADO_EXACTO') THEN '1) reenvío del mismo contenido con otro nombre 2) dos lotes legítimamente idénticos (raro). Ver L1.05.'
+            WHEN array_contains(marcas, 'VARIAS_FECHAS_CARGA') THEN '1) mismo archivo procesado dos veces (duplicados) 2) carga incremental del mismo archivo.'
+            WHEN array_contains(marcas, 'TAMANO_BAJO') THEN '1) archivo truncado o carga parcial (LD.08) 2) baja actividad real (feriado).'
+            WHEN array_contains(marcas, 'TAMANO_ALTO') THEN '1) archivo acumulado tras días sin envío 2) duplicado dentro del archivo 3) evento real.'
+            ELSE '1) llegada tardía (SLA) 2) convención: la fecha del nombre es la de negocio, no la de carga.' END AS hipotesis
+FROM f
+WHERE size(marcas) > 0
+UNION ALL
+SELECT '(OMITIDO)', CAST(NULL AS BIGINT), CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS DATE), CAST(NULL AS DATE),
+       CAST(NULL AS DATE), CAST(NULL AS DATE), CAST(NULL AS DATE), array('SIN_COLUMNA_LOTE'),
+       'No hay columna de archivo o lote: fijen dq_lv_col_lote si existe con otro nombre (ver LV.00).'
+WHERE dq_lv_col_lote = ''
+ORDER BY lote
+LIMIT 1000;
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+   [LV.08] Columnas que se vacían (o se llenan) en un periodo de carga
+   DOCSTRING (es-PE)
+     Por periodo del reloj principal (CARGA si existe; si no NEGOCIO o LOTE;
+     DIA si el rango ≤ 400 días, si no MES, o lo que indique
+     dq_lv_granularidad) calcula el % de vacíos (NULL o en blanco) de cada
+     columna (hasta dq_max_columnas_pares columnas) y lo compara con la
+     mediana de esa columna en todos los periodos. Marca VACIO_ANOMALO
+     (sube ≥ 20 puntos y al menos al doble + 5 puntos) y LLENO_INUSUAL
+     (columna casi siempre vacía que ese periodo viene llena). Requiere ≥ 5
+     periodos y ≥ 20 filas en el periodo.
+   TOOLTIP ▸ Cómo leer e interpretar (hipótesis alternativas)
+     • VACIO_ANOMALO en UNA columna un día: 1) campo no enviado o mal
+       mapeado en esa carga, 2) cambio de layout ese día (vean LD.09 y el
+       change log), 3) origen sin dato ese día.
+     • VACIO_ANOMALO en MUCHAS columnas el mismo periodo: registro cortado o
+       parser desalineado → vean LD.07 (largos de línea) para ese periodo.
+     • LLENO_INUSUAL: campo nuevo que empezó a llenarse (versión de layout)
+       o carga de prueba.
+   ──────────────────────────────────────────────────────────────────────────── */
+SET VAR dq_lv_rango_dias = coalesce((SELECT datediff(max(fecha), min(fecha)) FROM dq_lv_diario WHERE rol = dq_lv_rol_serie), 0);
+
+SET VAR dq_sql = coalesce((
+  SELECT IF(count(*) = 0 OR dq_lv_rol_serie = '', NULL, concat(
+    'WITH p AS (SELECT periodo, _n, stack(', CAST(count(*) AS STRING), ', ',
+    array_join(transform(array_sort(collect_list(struct(ordinal, s))), x -> x.s), ', '),
+    ') AS (columna, n_vacios) FROM (SELECT ',
+    IF(upper(dq_lv_granularidad) = 'MES' OR (upper(dq_lv_granularidad) = 'AUTO' AND dq_lv_rango_dias > 400),
+       'trunc(_dq_lv_f_serie, ', 'CAST(_dq_lv_f_serie AS DATE)'),
+    IF(upper(dq_lv_granularidad) = 'MES' OR (upper(dq_lv_granularidad) = 'AUTO' AND dq_lv_rango_dias > 400),
+       concat(dq_lit('MM'), ')'), ''),
+    ' AS periodo, count(*) AS _n, ',
+    array_join(transform(array_sort(collect_list(struct(ordinal, a))), x -> x.a), ', '),
+    ' FROM dq_lv_base WHERE _dq_lv_f_serie BETWEEN DATE', chr(39), '1950-01-01', chr(39),
+    ' AND date_add(current_date(), 366) GROUP BY 1) z), ',
+    'q AS (SELECT *, n_vacios / _n AS pct, percentile_approx(n_vacios / _n, 0.5) OVER (PARTITION BY columna) AS mediana, ',
+    'count(*) OVER (PARTITION BY columna) AS n_periodos FROM p) ',
+    'SELECT periodo, columna, _n AS n_filas_periodo, n_vacios, round(pct, 4) AS pct_vacios, round(mediana, 4) AS mediana_pct_vacios, ',
+    'CASE WHEN pct - mediana >= 0.2 AND pct >= 2 * mediana + 0.05 THEN ', dq_lit('VACIO_ANOMALO'), ' ELSE ', dq_lit('LLENO_INUSUAL'), ' END AS diagnostico, ',
+    'CASE WHEN pct - mediana >= 0.2 AND pct >= 2 * mediana + 0.05 THEN ',
+    dq_lit('1) campo no enviado o mal mapeado en esa carga 2) cambio de layout (LD.09, change log) 3) origen sin dato ese periodo. Si muchas columnas caen el mismo periodo: registro cortado o parser desalineado (LD.07).'),
+    ' ELSE ', dq_lit('1) campo nuevo que empezó a llenarse (versión de layout) 2) carga de prueba o corrección puntual.'), ' END AS hipotesis ',
+    'FROM q WHERE n_periodos >= 5 AND _n >= 20 AND ((pct - mediana >= 0.2 AND pct >= 2 * mediana + 0.05) OR (mediana >= 0.8 AND pct <= mediana - 0.5)) ',
+    'ORDER BY periodo, columna LIMIT 1000'))
+  FROM (SELECT ordinal,
+               concat(dq_lit(columna), ', _v', CAST(ordinal AS STRING)) AS s,
+               concat('count_if(', dq_id(columna), ' IS NULL OR trim(CAST(', dq_id(columna), ' AS STRING)) = ', dq_lit(''),
+                      ') AS _v', CAST(ordinal AS STRING)) AS a
+        FROM dq_columnas
+        WHERE columna IS NOT NULL AND columna NOT IN (dq_lv_col_carga, dq_lv_col_negocio, dq_lv_col_lote)
+          AND coalesce(familia, 'OTRO') NOT IN ('COMPLEJO', 'BINARIO')
+        ORDER BY ordinal
+        LIMIT 60)),
+  concat('SELECT ', dq_lit('OMITIDO'), ' AS diagnostico, ',
+         dq_lit('Sin reloj principal (LV.00) o sin columnas perfilables: no se puede medir vacíos por periodo.'), ' AS hipotesis'));
+EXECUTE IMMEDIATE dq_sql;
+
+SET VAR dq_log = array_append(dq_log, named_struct(
+  'paso', 'LV.02-LV.07',
+  'escenario', IF(dq_lv_rol_serie = '', 'VOLUMEN_OMITIDO', 'VOLUMEN_EVALUADO'),
+  'detalle', coalesce((
+    SELECT concat('reloj ', dq_lv_rol_serie, ': ', count_if(n = 0 AND base_mediana > 0 AND n_base >= 3 AND dias_al_final >= dq_lv_dias_recientes), ' días HUECO, ',
+                  count_if(n > 0 AND n_base >= 3 AND dias_al_final >= dq_lv_dias_recientes AND n / NULLIF(base_mediana, 0) < dq_lv_umbral_bajo), ' días BAJO, ',
+                  count_if(n_base >= 3 AND n / NULLIF(base_mediana, 0) > dq_lv_umbral_alto), ' días ALTO, de ', count(*), ' días')
+    FROM dq_lv_serie WHERE rol = dq_lv_rol_serie), 'sin serie'),
+  'interpretacion', 'Detalle y hipótesis en LV.02 (días), LV.03 (rachas), LV.04 (meses), LV.06 (recargas) y LV.07 (archivos). Un día anómalo no es por sí solo un error: revisen la columna hipotesis.'));
+```
+
 ## Appendix G: How the reference was tested (answer key you can reuse)
 
 **Environment.** PySpark 4.2.0 in local mode (`local[4]`, 3 GB driver memory,
@@ -2013,7 +2846,7 @@ failed.
 6. file 02 without P2.01–P2.03, then files 03–07;
 7. part B, then file 08 without L6.00;
 8. file 09 without L7.07;
-9. part C;
+9. part C, then part E;
 10. file 10 without L8.00 and L8.02;
 11. part D.
 
@@ -2039,8 +2872,10 @@ and backticks. The label of each result is the first `[ID]` in its comment block
 | D delimited | `linea` with `\|` separators | The same domain defects as B. |
 | E clean | fixed width with no defects | Control for false alarms. |
 | F placeholder | — | `dq_tabla_fq_manual` left at its default. |
+| G volume | tabular, ~42k rows, Jan–Jun 2024, with `fec_operacion` (text AAAAMMDD), `fecactualizacion` TIMESTAMP and `nombre_archivo` | Daily load D carries business date D−1 (95%) plus 5% late (D+1). Volume: weekdays ≈300, Saturday ≈150, Sunday ≈60; holidays at 20%. Seeded: (G1) the 13-Mar load did not run and its file was loaded on the 14th; (G2) the 17-Apr load is partial (25%); (G3) file 22-May resent as `…_REENVIO` and loaded on the 23rd; (G4) no loads 10–12 Jun; (G5) `cod_moneda` empty for the whole 20-Feb load; (G6) the last day holds only 40%. `dq_lv_feriados` = Semana Santa. |
+| H volume, clean | the same generator, no defects | Control for false alarms; holidays still lower volume. |
 
-**Assertions (the answer key) — all passing in both ANSI modes**
+**Assertions (the answer key)**
 
 | Scenario | The test asserts that… |
 |---|---|
@@ -2051,6 +2886,9 @@ and backticks. The label of each result is the first `[ID]` in its comment block
 | D | LD.05 finds currency 999 after splitting by `\|`. |
 | E | LD.02 and LD.05 report 0 invalid values; LD.09 reports only ALINEADO or NO_CONCLUYENTE; LD.08 balances (`diferencia_conteo = 0`). |
 | F | the run stops at Z1.03 with `[DQ-Z1] Completen dq_tabla_fq_manual…`, and nothing else fails. |
+| A, B, C (Capa V) | A: LV.00 picks `fecha_carga` as CARGA and LV.01 says `CARGA_UNICA` (snapshot). B: the `archivo` column survives fixed-width parsing and is picked as LOTE; `fec_operacion` is picked as NEGOCIO. C: LV.01 says `NO_DISPONIBLE` for all three clocks. |
+| G | LV.00 picks `fecactualizacion` / `fec_operacion` / `nombre_archivo`. LV.02: CARGA 13-Mar `HUECO`+`SIGUIENTE_ALTO`, 14-Mar `ALTO`+`PREVIO_HUECO`, 17-Apr `BAJO`, 23-May `ALTO`, 30-Jun `RECIENTE_POSIBLE_INCOMPLETO`; NEGOCIO 1-May and 28-Mar `BAJO`+`FERIADO`, 21-May `ALTO`. LV.03: 10–12 Jun `HUECO_HABIL` (3 days), 13-Mar `HUECO_CON_RECUPERACION`. LV.04: June has 27 load days. LV.05: p50 latency 1 day. LV.06: business date 21-May split across loads. LV.07: both 22-May files `DUPLICADO_EXACTO`, 17-Apr `TAMANO_BAJO`, 13-Mar `CARGADO_EN_OTRA_FECHA`. LV.08: `cod_moneda` `VACIO_ANOMALO` on 20-Feb. |
+| H | every LV.02 flag carries `FERIADO`/`DIA_POST_FERIADO` or is the last, still-arriving day; no `HUECO_HABIL`; LV.07 flags only `TAMANO_BAJO` on files following a holiday; LV.08 is empty. |
 
 **Bugs this suite caught, now fixed in the reference.** Use them as examples of
 what your own harness should catch:
@@ -2059,7 +2897,12 @@ what your own harness should catch:
 - A false alarm in LD.10 for a single-value domain.
 - `DIVIDE_BY_ZERO` in L8.04 on the empty table.
 - Trailer variables that were reset because they were redeclared after the
-  configuration block. **Declare every variable the team sets before
+  configuration block.
+- Fixed-width and delimited parsing dropped every source column except the
+  line, which lost the file name and load date. `Z2.04` now carries them
+  through (`dq_cols_extra_*`).
+- The old temporal layer (L4) counts volume on the *sample*, so low days can
+  look like holes. Capa V counts the full table. **Declare every variable the team sets before
   `VALORES A COMPLETAR`, never after.**
 
 **Reproduce it yourself.** Build a similar harness with **your** parsed

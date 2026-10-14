@@ -152,6 +152,13 @@ siguiente más específica**, hasta terminar como regla formal en la capa 8
 - Definan **la columna de evento** de cada tabla y su SLA; las demás fechas (nacimiento, alta) no se evalúan por frescura ni huecos.
 - **Centinelas de fecha** propios: lista en L4.00. **Calendario:** si el proceso no carga fines de semana/feriados, ignoren esos huecos en L4.03 (o crucen con una tabla de feriados).
 - `dq_fecha_min_valida` y `dq_tolerancia_futuro_dias` por dominio (vencimientos sí pueden ser futuros).
+- **Ojo:** L4.02-L4.04 cuentan volumen sobre la **muestra** (`dq_long`). Para
+  detectar cargas fallidas, parciales o duplicadas usen la **Capa V**
+  (`pruebas/sin_metadatos/ref_e_volumen.sql`, LV.00-LV.08), que cuenta la
+  tabla completa por fecha de carga (p.ej. `fecactualizacion`), fecha de
+  negocio y archivo, con línea base por día de semana, feriados de Perú,
+  latencia, recargas, archivos duplicados y columnas que se vacían en una
+  carga.
 
 ### Capa 5 — Categóricas (`07`)
 - Con **catálogos maestros** (ubigeo INEI, monedas ISO, productos) validen dominio cerrado como regla en la capa 8: `distrito IN (SELECT nombre FROM maestro.ubigeo)`.
@@ -235,6 +242,20 @@ cd pruebas
 python ejecutar_pruebas.py             # ANSI on
 python ejecutar_pruebas.py --sin-ansi  # ANSI off
 python ejecutar_pruebas.py --verbose   # ver resultados
+```
+
+**Modo sin metadatos** (sin `information_schema` ni `DESCRIBE`, sólo
+`SELECT`): `pruebas/sin_metadatos/` tiene las piezas de referencia
+(`ref_a`…`ref_e`) que usa `HANDOVER_AGENTE_TRAMA_LYNX.md` y un arnés con 8
+escenarios (tabular renombrado, ancho fijo con defectos, tabla vacía,
+delimitado, control limpio, tabla sin completar, volumen con cargas
+defectuosas y su control limpio):
+
+```bash
+cd pruebas/sin_metadatos
+python ejecutar_escenarios.py              # ANSI on
+python ejecutar_escenarios.py --sin-ansi   # ANSI off
+python ejecutar_escenarios.py --solo=G,H --verbose
 ```
 
 ---
